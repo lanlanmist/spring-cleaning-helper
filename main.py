@@ -7,21 +7,21 @@ import pyperclip
 import pyautogui
 import keyboard
 import threading
+import re
 from config import ocr
 from gui_selectors import RegionSelector, PointSelector
 
-# --- 你的自定义配置 ---
-DEFAULT_PROMPT = "请给出这道题的答案。如果单选，给出一个大写字母选项；如果多选，给出如：AB，AC，ABC这样的答案，不要给任何符号：\n"
+# --- 全局常量 ---
+DEFAULT_PROMPT = "请给出这道题的答案。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开。忽略最后的“查看提示”：\n"
 
 
 class OCRApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("大扫除小助手 V1.1 平安是福版")
-        self.root.geometry("460x900+50+50")
+        self.root.title("大扫除小助手 V2.0")
+        self.root.geometry("520x1000+50+50")
         self.root.attributes("-topmost", True)
 
-        # 坐标初始化
         self.roi = None
         self.answer_roi = None
         self.ai_input_pos = None
@@ -29,191 +29,258 @@ class OCRApp:
         self.next_btn_pos = None
         self.user_home_pos = None
 
+        self.is_running = False
+        self.stop_requested = False
+        self.current_options_map = {}
+
         self.setup_ui()
         self.start_hotkey_listener()
+
+    def log(self, message):
+        self.log_area.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        self.log_area.see(tk.END)
+        print(message)
 
     def setup_ui(self):
         # --- STEP 1: 坐标初始化 ---
         tk.Label(self.root, text=" STEP 1: 坐标初始化 ", fg="#E91E63", font=("微软雅黑", 10, "bold")).pack(pady=5)
-        tk.Button(self.root, text="🚀 顺序设定所有位置 (含答案区)", bg="#FF9800", fg="white",
+        tk.Button(self.root, text="🚀 顺序设定所有位置", bg="#FF9800", fg="white",
                   font=("微软雅黑", 10, "bold"), height=2, command=self.full_init).pack(fill="x", padx=40)
 
-        # --- STEP 2: Prompt 编辑区 ---
-        tk.Frame(self.root, height=2, bg="#eee").pack(fill="x", pady=10)
-        tk.Label(self.root, text=" STEP 2: AI 指令 (Prompt) ", fg="#009688", font=("微软雅黑", 10, "bold")).pack()
+        # --- STEP 2: AI 指令 ---
+        tk.Label(self.root, text=" STEP 2: AI 指令 (Prompt) ", fg="#009688", font=("微软雅黑", 10, "bold")).pack(pady=5)
         self.prompt_text = scrolledtext.ScrolledText(self.root, height=4, font=("微软雅黑", 9))
         self.prompt_text.insert(tk.END, DEFAULT_PROMPT)
-        self.prompt_text.pack(fill="x", padx=20, pady=5)
+        self.prompt_text.pack(fill="x", padx=20)
 
         # --- STEP 3: 自动化参数设置 ---
-        tk.Frame(self.root, height=2, bg="#eee").pack(fill="x", pady=5)
+        tk.Frame(self.root, height=2, bg="#eee").pack(fill="x", pady=10)
         param_frame = tk.Frame(self.root)
-        param_frame.pack(pady=5)
+        param_frame.pack()
 
-        tk.Label(param_frame, text="双击间隔(ms):").grid(row=0, column=0)
-        self.delay_click = tk.Entry(param_frame, width=8, justify='center')
-        self.delay_click.insert(0, "1000")
-        self.delay_click.grid(row=0, column=1, padx=5)
+        # 延时参数
+        tk.Label(param_frame, text="AI回答等待(ms):").grid(row=0, column=0)
+        self.delay_ai_wait = tk.Entry(param_frame, width=8, justify='center');
+        self.delay_ai_wait.insert(0, "10000")
+        self.delay_ai_wait.grid(row=0, column=1, padx=5)
 
-        tk.Label(param_frame, text="AI回答等待(ms):").grid(row=1, column=0)
-        self.delay_ai_wait = tk.Entry(param_frame, width=8, justify='center')
-        self.delay_ai_wait.insert(0, "6000")
-        self.delay_ai_wait.grid(row=1, column=1, padx=5, pady=5)
+        tk.Label(param_frame, text="多选/连击间隔(ms):").grid(row=0, column=2)
+        self.delay_auto_click = tk.Entry(param_frame, width=8, justify='center');
+        self.delay_auto_click.insert(0, "2000")
+        self.delay_auto_click.grid(row=0, column=3, padx=5)
 
-        # --- STEP 4: 快捷键设置 ---
-        tk.Label(self.root, text=" STEP 4: 快捷键设置 ", fg="#673AB7", font=("微软雅黑", 10, "bold")).pack()
-        hk_frame = tk.Frame(self.root)
+        tk.Label(param_frame, text="操作间微延迟(ms):").grid(row=1, column=0, pady=5)
+        self.delay_step = tk.Entry(param_frame, width=8, justify='center');
+        self.delay_step.insert(0, "300")
+        self.delay_step.grid(row=1, column=1)
+        tk.Label(param_frame, text="（移动与点击间缓冲）", fg="grey", font=("微软雅黑", 8)).grid(row=1, column=2,
+                                                                                               columnspan=2)
+
+        # 停止词
+        tk.Label(self.root, text="停止词设置 (,逗号隔开):", fg="#795548", font=("微软雅黑", 9)).pack()
+        self.stop_words_entry = tk.Entry(self.root, width=50, justify='center')
+        self.stop_words_entry.insert(0, "再来一组")
+        self.stop_words_entry.pack(pady=2)
+
+        self.loop_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.root, text="开启自动循环模式", variable=self.loop_var, font=("微软雅黑", 10, "bold"),
+                       fg="#FF5722").pack()
+
+        # --- STEP 4 & 5 ---
+        hk_frame = tk.Frame(self.root);
         hk_frame.pack(pady=5)
-        tk.Label(hk_frame, text="识题热键:").grid(row=0, column=0)
-        self.hk_ocr_entry = tk.Entry(hk_frame, width=10, justify='center')
-        self.hk_ocr_entry.insert(0, "f1")
-        self.hk_ocr_entry.grid(row=0, column=1, padx=5)
+        self.hk_ocr_entry = tk.Entry(hk_frame, width=8, justify='center');
+        self.hk_ocr_entry.insert(0, "f1");
+        self.hk_ocr_entry.grid(row=0, column=0, padx=5)
+        self.hk_next_entry = tk.Entry(hk_frame, width=8, justify='center');
+        self.hk_next_entry.insert(0, "f2");
+        self.hk_next_entry.grid(row=0, column=1, padx=5)
+        tk.Button(self.root, text="💾 应用热键", command=self.update_hotkeys).pack()
 
-        tk.Label(hk_frame, text="下一题热键:").grid(row=1, column=0)
-        self.hk_next_entry = tk.Entry(hk_frame, width=10, justify='center')
-        self.hk_next_entry.insert(0, "f2")
-        self.hk_next_entry.grid(row=1, column=1, padx=5)
-        tk.Button(self.root, text="💾 应用热键", command=self.update_hotkeys, bg="#607D8B", fg="white").pack(pady=5)
+        self.btn_run = tk.Button(self.root, text="【 F1：启动全自动任务 】", bg="#4CAF50", fg="white",
+                                 font=("微软雅黑", 12, "bold"), height=2, command=self.start_automation)
+        self.btn_run.pack(fill="x", padx=40, pady=5)
+        tk.Button(self.root, text="紧急停止 (Esc)", bg="#f44336", fg="white", command=self.stop_task).pack(fill="x",
+                                                                                                           padx=100)
 
-        # --- STEP 5: 手动操作区 ---
-        tk.Label(self.root, text=" STEP 5: 手动操作区 ", fg="#2196F3", font=("微软雅黑", 10, "bold")).pack(pady=5)
-        self.btn_ocr = tk.Button(self.root, text="【 识题 + 自动发送 】", bg="#4CAF50", fg="white",
-                                 font=("微软雅黑", 12, "bold"), height=2, command=self.start_ocr_thread)
-        self.btn_ocr.pack(fill="x", padx=40, pady=5)
+        self.log_area = scrolledtext.ScrolledText(self.root, height=10, font=("Consolas", 9), bg="#f8f8f8")
+        self.log_area.pack(fill="x", padx=20, pady=5)
 
-        self.btn_next = tk.Button(self.root, text="【 ⏭️ 下一题 】", bg="#4CAF50", fg="white",
-                                  font=("微软雅黑", 12, "bold"), height=2, command=self.action_next_question)
-        self.btn_next.pack(fill="x", padx=40, pady=5)
-
-        # --- 位置修正区 ---
-        tk.Label(self.root, text=" [ 位置修正 ] ", fg="grey", font=("微软雅黑", 9)).pack(pady=5)
-        fix_frame = tk.Frame(self.root)
-        fix_frame.pack()
+        fix_frame = tk.Frame(self.root);
+        fix_frame.pack(pady=5)
         btns = [("题目区", self.select_roi), ("答案区", self.select_answer_roi), ("输入框", self.select_ai_input),
                 ("发送键", self.select_ai_send), ("下一题", self.select_next_btn), ("归位点", self.select_home_pos)]
-        for i, (name, cmd) in enumerate(btns):
-            tk.Button(fix_frame, text=name, width=8, command=cmd).grid(row=i // 3, column=i % 3, padx=3, pady=3)
+        for i, (name, cmd) in enumerate(btns): tk.Button(fix_frame, text=name, width=8, command=cmd).grid(row=i // 3,
+                                                                                                          column=i % 3,
+                                                                                                          padx=2,
+                                                                                                          pady=2)
 
-    def start_ocr_thread(self):
-        threading.Thread(target=self.one_key_process, daemon=True).start()
+    # --- 拟人化点击工具 ---
+    def human_click(self, pos):
+        """执行 移动 -> 停顿 -> 点击 -> 停顿 的流程"""
+        try:
+            step_delay = int(self.delay_step.get()) / 1000.0
+        except:
+            step_delay = 0.3
+
+        pyautogui.moveTo(pos[0], pos[1], duration=step_delay)  # 平滑移动
+        time.sleep(step_delay)
+        pyautogui.mouseDown()
+        time.sleep(0.05)
+        pyautogui.mouseUp()
+        time.sleep(step_delay)
+
+    # --- 核心流程 ---
+    def start_automation(self):
+        if self.is_running: return
+        self.is_running = True
+        self.stop_requested = False
+        threading.Thread(target=self.main_loop, daemon=True).start()
+
+    def main_loop(self):
+        while self.is_running and not self.stop_requested:
+            if not self.one_key_process() or not self.loop_var.get(): break
+            time.sleep(1.0)
+        self.is_running = False
+        self.log(">>> 自动化已安全停止。")
 
     def one_key_process(self):
-        if not self.roi: return
+        if not self.roi: return False
+        self.current_options_map = {}
 
-        current_prompt = self.prompt_text.get("1.0", tk.END).strip() + "\n"
+        # 1. 识题
         with mss.mss() as sct:
             x1, y1, x2, y2 = self.roi
             shot = np.array(sct.grab({"left": int(x1), "top": int(y1), "width": int(x2 - x1), "height": int(y2 - y1)}))[
                    :, :, :3]
 
         result = ocr.ocr(shot, cls=False)
-        # --- 修正点：正确的 PaddleOCR 结果提取逻辑 ---
-        if result and result[0]:
-            lines = [line[1][0] for line in result[0]]  # 提取每一行的文本内容
-            original_text = "\n".join(lines).replace("查看提示", "")
-            final_text = current_prompt + original_text
-            pyperclip.copy(final_text)
+        if not result or not result[0]: return False
 
-            if self.ai_input_pos:
-                pyautogui.click(self.ai_input_pos)
-                time.sleep(0.1)
-                pyautogui.hotkey('ctrl', 'v')
-                time.sleep(0.1)
-                pyautogui.click(self.ai_send_pos)
-                if self.user_home_pos:
-                    pyautogui.moveTo(self.user_home_pos)
+        lines_text = []
+        has_options = False
+        stop_words = [w.strip() for w in self.stop_words_entry.get().split(',') if w.strip()]
 
+        for line in result[0]:
+            box, (text, conf) = line
+            lines_text.append(text)
+            for word in stop_words:
+                if word in text: self.log(f"检测到停止词: {word}"); return False
+            match = re.search(r'([A-H])', text.upper())
+            if match:
+                char = match.group(1)
+                self.current_options_map[char] = ((box[0][0] + box[2][0]) / 2 + x1, (box[0][1] + box[2][1]) / 2 + y1)
+                has_options = True
+
+        if not has_options: self.log("无选项，停止。"); return False
+
+        # 2. 发送 AI
+        pyperclip.copy(self.prompt_text.get("1.0", tk.END).strip() + "\n" + "\n".join(lines_text))
+        if self.ai_input_pos:
+            self.human_click(self.ai_input_pos)
+            pyautogui.hotkey('ctrl', 'v')
+            time.sleep(0.2)
+            self.human_click(self.ai_send_pos)
+            if self.user_home_pos: pyautogui.moveTo(self.user_home_pos)
+
+        # 3. 等待回答
+        try:
+            wait_ms = int(self.delay_ai_wait.get())
+        except:
+            wait_ms = 10000
+        for _ in range(int(wait_ms / 500)):
+            if self.stop_requested: return False
+            time.sleep(0.5)
+
+        # 4. 读答案并点击
+        answer = self.get_ai_answer_text()
+        if answer:
             try:
-                wait_time = int(self.delay_ai_wait.get()) / 1000.0
+                click_interval = int(self.delay_auto_click.get()) / 1000.0
             except:
-                wait_time = 10.0
+                click_interval = 2.0
+            for char in answer:
+                if self.stop_requested: return False
+                if char in self.current_options_map:
+                    self.log(f"点击选项 {char}")
+                    self.human_click(self.current_options_map[char])
+                    time.sleep(click_interval)
 
-            print(f"正在等待 AI 回答 ({wait_time}s)...")
-            time.sleep(wait_time)
-            self.ocr_answer_area()
+            # 5. 点击下一题 (同步优化：两次点击，含间隔)
+            self.action_next_question()
+            return True
+        return False
 
-    def ocr_answer_area(self):
-        if not self.answer_roi: return
+    def action_next_question(self):
+        """执行下一题：点击 -> 延迟 -> 点击"""
+        if not self.next_btn_pos: return
+        try:
+            click_interval = int(self.delay_auto_click.get()) / 1000.0  # 复用点击间隔参数
+        except:
+            click_interval = 2.0
+
+        self.log("执行下一题连点...")
+        self.human_click(self.next_btn_pos)  # 第一次点击
+        time.sleep(click_interval)  # 等待间隔
+        self.human_click(self.next_btn_pos)  # 第二次点击
+
+        # 归位鼠标方便观察
+        self.root.update()
+        pyautogui.moveTo(self.btn_run.winfo_rootx() + 50, self.btn_run.winfo_rooty() + 20, duration=0.5)
+
+    def get_ai_answer_text(self):
+        if not self.answer_roi: return None
         with mss.mss() as sct:
             x1, y1, x2, y2 = self.answer_roi
             shot = np.array(sct.grab({"left": int(x1), "top": int(y1), "width": int(x2 - x1), "height": int(y2 - y1)}))[
                    :, :, :3]
-
         result = ocr.ocr(shot, cls=False)
-        # --- 修正点：同步答案区的提取逻辑 ---
         if result and result[0]:
-            lines = [line[1][0] for line in result[0]]
-            answer_text = "".join(lines)
-            print(f">>> [自动检测] AI 答案: {answer_text}")
+            raw_ans = "".join([line[1][0] for line in result[0]]).upper()
+            return "".join(re.findall(r'[A-H]', raw_ans))
+        return None
 
-    def action_next_question(self):
-        if not self.next_btn_pos: return
-        try:
-            delay = int(self.delay_click.get()) / 1000.0
-        except:
-            delay = 1.0
-        pyautogui.click(self.next_btn_pos)
-        time.sleep(delay)
-        pyautogui.click(self.next_btn_pos)
-
-        self.root.update()
-        btn_pos = (self.btn_ocr.winfo_rootx() + self.btn_ocr.winfo_width() // 2,
-                   self.btn_ocr.winfo_rooty() + self.btn_ocr.winfo_height() // 2)
-        pyautogui.moveTo(btn_pos)
+    def stop_task(self):
+        self.stop_requested = True; self.is_running = False
 
     def update_hotkeys(self):
         keyboard.unhook_all()
-        try:
-            keyboard.add_hotkey(self.hk_ocr_entry.get().strip(), self.start_ocr_thread)
-            keyboard.add_hotkey(self.hk_next_entry.get().strip(), self.action_next_question)
-            print("热键更新成功")
-        except:
-            pass
+        keyboard.add_hotkey(self.hk_ocr_entry.get().strip(), self.start_automation)
+        keyboard.add_hotkey(self.hk_next_entry.get().strip(), self.action_next_question)
+        keyboard.add_hotkey('esc', self.stop_task)
 
     def start_hotkey_listener(self):
         threading.Thread(target=self.update_hotkeys, daemon=True).start()
 
+    # --- 选择逻辑 (省略，代码同前) ---
     def select_roi(self):
-        s = RegionSelector(self.root, "框选【题目区域】")
-        self.root.wait_window(s.win)
-        if not s.cancelled: self.roi = s.selection; return True
-        return False
+        s = RegionSelector(self.root, "框选题目区"); self.root.wait_window(
+            s.win); self.roi = s.selection if not s.cancelled else self.roi; return not s.cancelled
 
     def select_answer_roi(self):
-        s = RegionSelector(self.root, "框选【AI 答案显示区域】")
-        self.root.wait_window(s.win)
-        if not s.cancelled: self.answer_roi = s.selection; return True
-        return False
+        s = RegionSelector(self.root, "框选答案区"); self.root.wait_window(
+            s.win); self.answer_roi = s.selection if not s.cancelled else self.answer_roi; return not s.cancelled
 
     def select_ai_input(self):
-        p = PointSelector(self.root, "点击【AI 输入框】")
-        self.root.wait_window(p.win)
-        if not p.cancelled: self.ai_input_pos = p.pos; return True
-        return False
+        p = PointSelector(self.root, "点击输入框"); self.root.wait_window(
+            p.win); self.ai_input_pos = p.pos if not p.cancelled else self.ai_input_pos; return not p.cancelled
 
     def select_ai_send(self):
-        p = PointSelector(self.root, "点击【AI 发送按钮】")
-        self.root.wait_window(p.win)
-        if not p.cancelled: self.ai_send_pos = p.pos; return True
-        return False
+        p = PointSelector(self.root, "点击发送键"); self.root.wait_window(
+            p.win); self.ai_send_pos = p.pos if not p.cancelled else self.ai_send_pos; return not p.cancelled
 
     def select_next_btn(self):
-        p = PointSelector(self.root, "点击【下一题】按钮")
-        self.root.wait_window(p.win)
-        if not p.cancelled: self.next_btn_pos = p.pos; return True
-        return False
+        p = PointSelector(self.root, "点击下一题点"); self.root.wait_window(
+            p.win); self.next_btn_pos = p.pos if not p.cancelled else self.next_btn_pos; return not p.cancelled
 
     def select_home_pos(self):
-        p = PointSelector(self.root, "点击【鼠标归位点】")
-        self.root.wait_window(p.win)
-        if not p.cancelled: self.user_home_pos = p.pos; return True
-        return False
+        p = PointSelector(self.root, "点击归位点"); self.root.wait_window(
+            p.win); self.user_home_pos = p.pos if not p.cancelled else self.user_home_pos; return not p.cancelled
 
     def full_init(self):
-        steps = [self.select_roi, self.select_answer_roi, self.select_ai_input,
-                 self.select_ai_send, self.select_next_btn, self.select_home_pos]
-        for step_func in steps:
-            if not step_func(): break
+        for f in [self.select_roi, self.select_answer_roi, self.select_ai_input, self.select_ai_send,
+                  self.select_next_btn, self.select_home_pos]:
+            if not f(): break
 
 
 if __name__ == "__main__":

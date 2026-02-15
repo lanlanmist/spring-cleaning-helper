@@ -1,14 +1,15 @@
-# 欢迎使用 大扫除小助手 V1.1
+# 欢迎使用 大扫除小助手 V2.0
 
 ## ChangeLog
 
+- **V2.0**: 实现自动化循环流程，支持连续处理 5 道题目；新增自动点选答案、自动提交及自动翻页功能。
 - **V1.1**: 代码重构：将原本 main.py 拆分为三个独立的功能模块。
 - **V1.0**: 完成核心功能开发，支持单项题目识别。
 
 ## 环境搭建
 
 - **scrcpy**: 下载scrcoy，从https://scrcpy.org/
-- **环境依赖**: 建议新建立python虚拟环境搭建
+- **环境依赖**: 建议新建立一个Python3.9虚拟环境搭建
 ```python
 pip install -r requirements.txt
 ```
@@ -28,8 +29,6 @@ adb devices
 scrcpy -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake
 ```
 建议使用上述命令，包含连接画面置顶，关闭屏幕，不自动锁屏。可按需调整。
-
-- **python**: 执行start.bat
 
 - **页面布局**: 推荐的页面布局为，手机画面放在屏幕右侧，千问-Qwen3-Flash模型网页放在左侧，本程序窗口贴着手机画面的左边沿。
 
