@@ -1,0 +1,38 @@
+# 欢迎使用 大扫除小助手 V1.0
+
+## ChangeLog
+
+- **V1.0**: 完成核心功能开发，支持单项题目识别。
+
+## 环境搭建
+
+- **scrcpy**: 下载scrcoy，从https://scrcpy.org/
+- **环境依赖**: 建议新建立python虚拟环境搭建
+```python
+pip install -r requirements.txt
+```
+- **手机端**: 打开adb调试，如有“安全设置（允许模拟点击）”选项，一并打开。
+
+
+## 快速开始
+
+- **scrcpy**: 查看连接的设备
+
+```cmd
+adb devices
+```
+获取到已连接设备的ID，如果同时使用安卓虚拟机，需要排查手机设备是哪个，部分安卓虚拟机支持自定义设备ID，能帮助排查。
+而后使用scrcpy连接到手机
+```cmd
+scrcpy -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake
+```
+建议使用上述命令，包含连接画面置顶，关闭屏幕，不自动锁屏。可按需调整。
+
+- **python**: 执行start.bat
+
+- **页面布局**: 推荐的页面布局为，手机画面放在屏幕右侧，千问-Qwen3-Flash模型网页放在左侧，本程序窗口贴着手机画面的左边沿。
+
+- **千问-Qwen3-Flash**: 需要先写一句promote，比如：“我会告诉你题目，你直接告诉我答案，不要做任何解析”
+
+
+**祝您使用愉快！**
