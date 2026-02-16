@@ -16,15 +16,15 @@ from tkinter import messagebox
 from gui_selectors import RegionSelector, PointSelector
 
 # --- 全局常量 ---
-DEFAULT_PROMPT = "请给出这道题的答案。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开。忽略最后的“查看提示”：\n"
+DEFAULT_PROMPT = "请给出这道题的答案。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开：\n"
 CONFIG_FILE = "positions.json"
-APP_VERSION ="大扫除小助手 V2.2"
+APP_VERSION ="大扫除小助手 V2.3"
 
 class OCRApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(APP_VERSION)
-        self.root.geometry("520x800+800+50")
+        self.root.geometry("520x850+800+50")
         self.root.attributes("-topmost", True)
 
         self.roi = None
@@ -102,6 +102,16 @@ class OCRApp:
         self.trigger_word_entry.insert(0, "再来一组")
         self.trigger_word_entry.pack(pady=2)
 
+        tk.Label(self.root, text="自动检测下一题按钮文字:", font=("微软雅黑", 9)).pack()
+        self.confirm_word_entry = tk.Entry(self.root, width=30, justify='center')
+        self.confirm_word_entry.insert(0, "确定")
+        self.confirm_word_entry.pack(pady=2)
+
+        tk.Label(self.root, text="发送AI前，严格去掉末尾文本:", font=("微软雅黑", 9)).pack()
+        self.trim_suffix_entry = tk.Entry(self.root, width=30, justify='center')
+        self.trim_suffix_entry.insert(0, "查看提示")
+        self.trim_suffix_entry.pack(pady=2)
+
         param_extra = tk.Frame(self.root)
         param_extra.pack(pady=5)
 
@@ -128,12 +138,124 @@ class OCRApp:
 
         fix_frame = tk.Frame(self.root);
         fix_frame.pack(pady=5)
-        btns = [("题目区", self.select_roi), ("答案区", self.select_answer_roi), ("输入框", self.select_ai_input),
-                ("发送键", self.select_ai_send), ("下一题", self.select_next_btn)]
-        for i, (name, cmd) in enumerate(btns): tk.Button(fix_frame, text=name, width=8, command=cmd).grid(row=i // 3,
-                                                                                                          column=i % 3,
-                                                                                                          padx=2,
-                                                                                                          pady=2)
+        btns = [("题目区", self.select_roi), ("答案区", self.select_answer_roi),
+                ("输入框", self.select_ai_input), ("发送键", self.select_ai_send)]
+        for i, (name, cmd) in enumerate(btns):
+            tk.Button(fix_frame, text=name, width=10, command=cmd).grid(row=0, column=i, padx=4, pady=2)
+
+    def _get_click_interval_s(self):
+        try:
+            return int(self.delay_auto_click.get()) / 1000.0
+        except:
+            return 2.0
+
+    def _trim_question_suffix(self, question_text):
+        suffix = self.trim_suffix_entry.get().strip()
+        if suffix and question_text.endswith(suffix):
+            self.log(f"检测到题目尾部“{suffix}”，已严格移除。")
+            return question_text[:-len(suffix)]
+        return question_text
+
+    def detect_and_cache_confirm_btn(self):
+        """在题目区域 OCR 查找“确定”等目标文字，找到后写入 next_btn_pos 并持久化。"""
+        if not self.roi:
+            return False
+
+        target = self.confirm_word_entry.get().strip() or "确定"
+        x1, y1, x2, y2 = self.roi
+        with mss.mss() as sct:
+            shot = np.array(
+                sct.grab({
+                    "left": int(x1),
+                    "top": int(y1),
+                    "width": int(x2 - x1),
+                    "height": int(y2 - y1)
+                })
+            )[:, :, :3]
+
+        result = ocr.ocr(shot, cls=False)
+        if not result or not result[0]:
+            self.log(f"OCR 未识别到“{target}”。")
+            return False
+
+        best = None
+        for line in result[0]:
+            box, (text, conf) = line
+            t = text.strip()
+            if t == target:
+                best = (box, text, conf)
+                break
+            if target in t and best is None:
+                best = (box, text, conf)
+
+        if not best:
+            self.log(f"未找到目标按钮文字：{target}")
+            return False
+
+        box, text, conf = best
+        center_x = (box[0][0] + box[2][0]) / 2 + x1
+        center_y = (box[0][1] + box[2][1]) / 2 + y1
+        self.next_btn_pos = (center_x, center_y)
+        self.save_config(changed_key="next_btn_pos")
+        self.log(f"已自动定位“{target}”并写入配置: ({int(center_x)}, {int(center_y)})")
+        return True
+
+    def build_option_map_from_layout(self, ocr_lines, x1, y1, x2, y2):
+        """根据OCR得到的题干/选项布局，模拟选项点击位置（严格限制在题目ROI内）。"""
+        option_map = {}
+
+        question_bottom = y1
+        option_candidates = []  # (letter, center_y, center_x)
+
+        for box, text in ocr_lines:
+            center_x = (box[0][0] + box[2][0]) / 2 + x1
+            center_y = (box[0][1] + box[2][1]) / 2 + y1
+            box_bottom = max(p[1] for p in box) + y1
+
+            m = re.match(r'^\s*([A-H])[\.。:：、\)）]?\s*', text.upper())
+            if m:
+                option_candidates.append((m.group(1), center_y, center_x))
+            else:
+                # 仅把非选项文本当作题干，用于估算选项起始位置
+                question_bottom = max(question_bottom, box_bottom)
+
+        # 若识别到真实选项字母，直接使用其纵向分布
+        for ch, cy, _ in sorted(option_candidates, key=lambda t: t[1]):
+            if ch not in option_map:
+                option_map[ch] = cy
+
+        sorted_y = sorted([cy for _, cy, _ in option_candidates])
+        if len(sorted_y) >= 2:
+            gaps = [sorted_y[i + 1] - sorted_y[i] for i in range(len(sorted_y) - 1)]
+            step = max(36.0, min(95.0, float(np.median(gaps))))
+            start_y = sorted_y[0]
+        else:
+            # 没有或仅有一行时，用题干底部到roi底部估算4行
+            option_top = min(max(question_bottom + 10, y1 + 40), y2 - 120)
+            available_h = max(120.0, y2 - option_top - 20)
+            step = max(42.0, min(88.0, available_h / 4.0))
+            start_y = option_top + step * 0.5
+
+        # 至少补齐A-D，最多补到H
+        for idx in range(8):
+            ch = chr(ord('A') + idx)
+            if ch not in option_map:
+                option_map[ch] = start_y + idx * step
+
+        # X 使用“识别到的选项字母X中位数”，否则使用ROI内固定安全列
+        if option_candidates:
+            xs = sorted([cx for _, _, cx in option_candidates])
+            click_x = xs[len(xs) // 2] + 120
+        else:
+            click_x = x1 + (x2 - x1) * 0.6
+        click_x = min(max(click_x, x1 + 20), x2 - 20)
+
+        final_map = {}
+        for ch, cy in option_map.items():
+            safe_y = min(max(cy, y1 + 20), y2 - 20)
+            final_map[ch] = (click_x, safe_y)
+
+        return final_map
 
     # --- 拟人化点击工具 ---
     def human_click(self, pos):
@@ -200,9 +322,11 @@ class OCRApp:
         stop_words = [w.strip() for w in self.stop_words_entry.get().split(',') if w.strip()]
         trigger_word = self.trigger_word_entry.get().strip()
 
+        ocr_lines = []
         for line in result[0]:
             box, (text, conf) = line
             lines_text.append(text)
+            ocr_lines.append((box, text))
 
             # --- 停止词逻辑 ---
             for word in stop_words:
@@ -211,14 +335,9 @@ class OCRApp:
                     if self.stop_on_word_var.get():
                         return False
 
-            match = re.search(r'([A-H])', text.upper())
-            if match:
-                char = match.group(1)
-                self.current_options_map[char] = (
-                    (box[0][0] + box[2][0]) / 2 + x1,
-                    (box[0][1] + box[2][1]) / 2 + y1
-                )
-                has_options = True
+        # 根据OCR布局模拟选项位置，避免点到题目外
+        self.current_options_map = self.build_option_map_from_layout(ocr_lines, x1, y1, x2, y2)
+        has_options = len(self.current_options_map) > 0
 
         # =========================
         # 触发文字点击逻辑（新版）
@@ -293,7 +412,9 @@ class OCRApp:
         if not has_options: self.log("无选项，停止。"); return False
 
         # 2. 发送 AI
-        pyperclip.copy(self.prompt_text.get("1.0", tk.END).strip() + "\n" + "\n".join(lines_text))
+        question_text = "\n".join(lines_text)
+        question_text = self._trim_question_suffix(question_text)
+        pyperclip.copy(self.prompt_text.get("1.0", tk.END).strip() + "\n" + question_text)
         if self.ai_input_pos:
             self.human_click(self.ai_input_pos)
             pyautogui.hotkey('ctrl', 'v')
@@ -312,10 +433,7 @@ class OCRApp:
         # 4. 读答案并点击
         answer = self.get_ai_answer_text()
         if answer:
-            try:
-                click_interval = int(self.delay_auto_click.get()) / 1000.0
-            except:
-                click_interval = 2.0
+            click_interval = self._get_click_interval_s()
             for char in answer:
                 if self.stop_requested: return False
                 if char in self.current_options_map:
@@ -324,6 +442,13 @@ class OCRApp:
                     time.sleep(click_interval)
 
             # 5. 点击下一题 (同步优化：两次点击，含间隔)
+            if not self.next_btn_pos:
+                self.log("未配置“下一题”按钮，开始自动识别...")
+                time.sleep(click_interval)
+                if not self.detect_and_cache_confirm_btn():
+                    self.log("自动识别下一题按钮失败，本轮停止。")
+                    return False
+                time.sleep(click_interval)
             self.action_next_question()
             return True
         return False
@@ -331,10 +456,7 @@ class OCRApp:
     def action_next_question(self):
         """执行下一题：点击 -> 延迟 -> 点击"""
         if not self.next_btn_pos: return
-        try:
-            click_interval = int(self.delay_auto_click.get()) / 1000.0  # 复用点击间隔参数
-        except:
-            click_interval = 2.0
+        click_interval = self._get_click_interval_s()
 
         self.log("执行下一题连点...")
         # 第一次点击（提交答案）
@@ -363,20 +485,37 @@ class OCRApp:
     def stop_task(self):
         self.stop_requested = True; self.is_running = False
 
-    def save_config(self):
-        data = {
-            "app_version": APP_VERSION,
-            "roi": self.roi,
-            "answer_roi": self.answer_roi,
-            "ai_input_pos": self.ai_input_pos,
-            "ai_send_pos": self.ai_send_pos,
-            "next_btn_pos": self.next_btn_pos
-        }
+    def save_config(self, changed_key=None):
+        data = {}
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    old_data = json.load(f)
+                    if isinstance(old_data, dict):
+                        data = old_data
+            except:
+                data = {}
+
+        data["app_version"] = APP_VERSION
+
+        if changed_key is None:
+            data.update({
+                "roi": self.roi,
+                "answer_roi": self.answer_roi,
+                "ai_input_pos": self.ai_input_pos,
+                "ai_send_pos": self.ai_send_pos,
+                "next_btn_pos": self.next_btn_pos
+            })
+        else:
+            data[changed_key] = getattr(self, changed_key, None)
 
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
 
-        self.log("坐标配置已保存。")
+        if changed_key:
+            self.log(f"配置已更新：{changed_key}")
+        else:
+            self.log("坐标配置已保存。")
 
     def validate_config(self, data):
         # 检查版本号
@@ -388,8 +527,7 @@ class OCRApp:
                 "roi",
                 "answer_roi",
                 "ai_input_pos",
-                "ai_send_pos",
-                "next_btn_pos"
+                "ai_send_pos"
             ]
 
             for key in required_keys:
@@ -404,8 +542,12 @@ class OCRApp:
                 return False
 
             # 检查点位
-            for key in ["ai_input_pos", "ai_send_pos", "next_btn_pos"]:
+            for key in ["ai_input_pos", "ai_send_pos"]:
                 if not isinstance(data[key], list) or len(data[key]) != 2:
+                    return False
+
+            if "next_btn_pos" in data and data["next_btn_pos"] is not None:
+                if not isinstance(data["next_btn_pos"], list) or len(data["next_btn_pos"]) != 2:
                     return False
 
             return True
@@ -429,7 +571,8 @@ class OCRApp:
             self.answer_roi = tuple(data["answer_roi"])
             self.ai_input_pos = tuple(data["ai_input_pos"])
             self.ai_send_pos = tuple(data["ai_send_pos"])
-            self.next_btn_pos = tuple(data["next_btn_pos"])
+            next_btn_pos = data.get("next_btn_pos")
+            self.next_btn_pos = tuple(next_btn_pos) if isinstance(next_btn_pos, list) and len(next_btn_pos) == 2 else None
 
             self.config_loaded = True
             self.log("成功加载历史坐标配置。")
@@ -444,7 +587,7 @@ class OCRApp:
 
         if not s.cancelled:
             self.roi = s.selection
-            self.save_config()
+            self.save_config(changed_key="roi")
 
         return not s.cancelled
 
@@ -454,7 +597,7 @@ class OCRApp:
 
         if not s.cancelled:
             self.answer_roi = s.selection
-            self.save_config()
+            self.save_config(changed_key="answer_roi")
 
         return not s.cancelled
 
@@ -464,7 +607,7 @@ class OCRApp:
 
         if not p.cancelled:
             self.ai_input_pos = p.pos
-            self.save_config()
+            self.save_config(changed_key="ai_input_pos")
 
         return not p.cancelled
 
@@ -474,23 +617,12 @@ class OCRApp:
 
         if not p.cancelled:
             self.ai_send_pos = p.pos
-            self.save_config()
-
-        return not p.cancelled
-
-    def select_next_btn(self):
-        p = PointSelector(self.root, "点击下一题点")
-        self.root.wait_window(p.win)
-
-        if not p.cancelled:
-            self.next_btn_pos = p.pos
-            self.save_config()
+            self.save_config(changed_key="ai_send_pos")
 
         return not p.cancelled
 
     def full_init(self):
-        for f in [self.select_roi, self.select_answer_roi, self.select_ai_input, self.select_ai_send,
-                  self.select_next_btn]:
+        for f in [self.select_roi, self.select_answer_roi, self.select_ai_input, self.select_ai_send]:
             if not f(): break
 
     def save_question_screenshot(self):

@@ -1,7 +1,8 @@
-# 欢迎使用 大扫除小助手 V2.2
+# 欢迎使用 大扫除小助手 V2.3
 
 ## ChangeLog
 
+- **V2.3**: 实现"下一题"按钮的自动 OCR 识别与定位，支持按钮名称自定义配置，无需手动预选点位;重构选项点选逻辑，现根据 OCR 题目文本推理选项范围，避免了将题目内容中的干扰字母误判为选项序号。
 - **V2.2**: 清理了早期开发中不再使用的废弃代码块，移除冗余功能；新增 OCR 识别区域配置的本地持久化；增加"截图日后再学"功能，支持将特定题目截图保存至本地。
 - **V2.1**: 实现自选刷题组数功能，用户可根据需求自定义自动化运行的轮次。
 - **V2.0**: 实现自动化循环流程，支持连续处理 5 道题目；新增自动点选答案、自动提交及自动翻页功能。
@@ -28,12 +29,21 @@ requirements_original是全量环境，requirements_slim是pipreqs生成。
 ```cmd
 adb devices
 ```
+
 获取到已连接设备的ID，如果同时使用安卓虚拟机，需要排查手机设备是哪个，部分安卓虚拟机支持自定义设备ID，能帮助排查。
 而后使用scrcpy连接到手机
+
 ```cmd
 scrcpy -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake
 ```
+
 建议使用上述命令，包含连接画面置顶，关闭屏幕，不自动锁屏。可按需调整。
+
+```cmd
+scrcpy -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake -m 0 --video-bit-rate 30M --max-fps 60  -s 46HDU19821003245 --always-on-top --turn-screen-off --stay-awake -m 0 --video-bit-rate 30M --max-fps 60"
+```
+
+或者使用上述命令，极致色彩。
 
 - **页面布局**: 请打开手机画面，千问-Qwen3-Flash模型网页，本程序窗口，均放置在前页。
 
