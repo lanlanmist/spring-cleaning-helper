@@ -18,8 +18,8 @@ DEFAULT_PROMPT = "请给出这道题的答案。如果单选，给出一个大�
 class OCRApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("大扫除小助手 V2.0")
-        self.root.geometry("520x1000+50+50")
+        self.root.title("大扫除小助手 V2.1")
+        self.root.geometry("520x850+800+50")
         self.root.attributes("-topmost", True)
 
         self.roi = None
@@ -82,9 +82,36 @@ class OCRApp:
         self.stop_words_entry.insert(0, "再来一组")
         self.stop_words_entry.pack(pady=2)
 
+        # 是否启用停止词停止
+        self.stop_on_word_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.root, text="遇到停止词时自动停止",
+                       variable=self.stop_on_word_var,
+                       font=("微软雅黑", 9),
+                       fg="#795548").pack()
+
+        # 捕获特定文字点击功能
+        tk.Label(self.root, text="检测到文字时点击（默认：再来一组）:", font=("微软雅黑", 9)).pack()
+
+        self.trigger_word_entry = tk.Entry(self.root, width=30, justify='center')
+        self.trigger_word_entry.insert(0, "再来一组")
+        self.trigger_word_entry.pack(pady=2)
+
+        param_extra = tk.Frame(self.root)
+        param_extra.pack(pady=5)
+
+        tk.Label(param_extra, text="触发点击延时(ms):").grid(row=0, column=0)
+        self.delay_trigger_click = tk.Entry(param_extra, width=8, justify='center')
+        self.delay_trigger_click.insert(0, "3000")
+        self.delay_trigger_click.grid(row=0, column=1, padx=5)
+
+        tk.Label(param_extra, text="点击几次后停止:").grid(row=0, column=2)
+        self.max_trigger_times = tk.Entry(param_extra, width=8, justify='center')
+        self.max_trigger_times.insert(0, "5")
+        self.max_trigger_times.grid(row=0, column=3, padx=5)
+
         self.loop_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(self.root, text="开启自动循环模式", variable=self.loop_var, font=("微软雅黑", 10, "bold"),
-                       fg="#FF5722").pack()
+        # tk.Checkbutton(self.root, text="开启自动循环模式", variable=self.loop_var, font=("微软雅黑", 10, "bold"),
+        #                fg="#FF5722").pack()
 
         # --- STEP 4 & 5 ---
         hk_frame = tk.Frame(self.root);
@@ -135,6 +162,7 @@ class OCRApp:
         if self.is_running: return
         self.is_running = True
         self.stop_requested = False
+        self.trigger_click_count = 0    # ✅ 只在启动时清零
         threading.Thread(target=self.main_loop, daemon=True).start()
 
     def main_loop(self):
@@ -160,17 +188,100 @@ class OCRApp:
         lines_text = []
         has_options = False
         stop_words = [w.strip() for w in self.stop_words_entry.get().split(',') if w.strip()]
+        trigger_word = self.trigger_word_entry.get().strip()
 
         for line in result[0]:
             box, (text, conf) = line
             lines_text.append(text)
+
+            # --- 停止词逻辑 ---
             for word in stop_words:
-                if word in text: self.log(f"检测到停止词: {word}"); return False
+                if word in text:
+                    self.log(f"检测到停止词: {word}")
+                    if self.stop_on_word_var.get():
+                        return False
+
+
+
+
             match = re.search(r'([A-H])', text.upper())
             if match:
                 char = match.group(1)
-                self.current_options_map[char] = ((box[0][0] + box[2][0]) / 2 + x1, (box[0][1] + box[2][1]) / 2 + y1)
+                self.current_options_map[char] = (
+                    (box[0][0] + box[2][0]) / 2 + x1,
+                    (box[0][1] + box[2][1]) / 2 + y1
+                )
                 has_options = True
+
+        # =========================
+        # 触发文字点击逻辑（新版）
+        # =========================
+        trigger_word = self.trigger_word_entry.get().strip()
+
+        if trigger_word:
+            for line in result[0]:
+                box, (text, conf) = line
+
+                if trigger_word in text:
+                    self.log(f"检测到触发文字：{trigger_word}")
+
+                    try:
+                        delay_ms = int(self.delay_trigger_click.get())
+                    except:
+                        delay_ms = 3000
+
+                    try:
+                        max_times = int(self.max_trigger_times.get())
+                    except:
+                        max_times = 5
+
+                    if self.trigger_click_count >= max_times:
+                        self.log("达到最大触发次数，自动停止")
+                        return False
+
+                    # 计算文字中心点（全局坐标）
+                    center_x = (box[0][0] + box[2][0]) / 2 + x1
+                    center_y = (box[0][1] + box[2][1]) / 2 + y1
+
+                    while True:
+                        self.log("等待触发延时...")
+                        time.sleep(delay_ms / 1000.0)
+
+                        self.human_click((center_x, center_y))
+                        self.log("已点击触发文字")
+
+                        # 再次 OCR 检查是否仍存在
+                        with mss.mss() as sct:
+                            shot2 = np.array(
+                                sct.grab({
+                                    "left": int(x1),
+                                    "top": int(y1),
+                                    "width": int(x2 - x1),
+                                    "height": int(y2 - y1)
+                                })
+                            )[:, :, :3]
+
+                        result2 = ocr.ocr(shot2, cls=False)
+
+                        still_exists = False
+                        if result2 and result2[0]:
+                            for line2 in result2[0]:
+                                if trigger_word in line2[1][0]:
+                                    still_exists = True
+                                    break
+
+                        if not still_exists:
+                            self.trigger_click_count += 1
+                            self.log(f"触发完成 {self.trigger_click_count}/{max_times}")
+
+                            # ===== 新增：完成后再等待一次延时 =====
+                            self.log("触发完成后等待稳定...")
+                            time.sleep(delay_ms / 1000.0)
+
+                            return True
+
+                    # 触发完成后继续原流程
+                    break
 
         if not has_options: self.log("无选项，停止。"); return False
 
