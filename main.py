@@ -3,23 +3,28 @@ from tkinter import scrolledtext
 import time
 import numpy as np
 import mss
+import mss.tools
+from datetime import datetime
 import pyperclip
 import pyautogui
-import keyboard
 import threading
 import re
 from config import ocr
+import json
+import os
+from tkinter import messagebox
 from gui_selectors import RegionSelector, PointSelector
 
 # --- 全局常量 ---
 DEFAULT_PROMPT = "请给出这道题的答案。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开。忽略最后的“查看提示”：\n"
-
+CONFIG_FILE = "positions.json"
+APP_VERSION ="大扫除小助手 V2.2"
 
 class OCRApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("大扫除小助手 V2.1")
-        self.root.geometry("520x850+800+50")
+        self.root.title(APP_VERSION)
+        self.root.geometry("520x800+800+50")
         self.root.attributes("-topmost", True)
 
         self.roi = None
@@ -27,14 +32,15 @@ class OCRApp:
         self.ai_input_pos = None
         self.ai_send_pos = None
         self.next_btn_pos = None
-        self.user_home_pos = None
 
         self.is_running = False
         self.stop_requested = False
         self.current_options_map = {}
+        self.config_loaded = False
 
         self.setup_ui()
-        self.start_hotkey_listener()
+        self.load_config()
+        self.root.bind('<Escape>', lambda e: self.stop_task())
 
     def log(self, message):
         self.log_area.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
@@ -110,21 +116,8 @@ class OCRApp:
         self.max_trigger_times.grid(row=0, column=3, padx=5)
 
         self.loop_var = tk.BooleanVar(value=True)
-        # tk.Checkbutton(self.root, text="开启自动循环模式", variable=self.loop_var, font=("微软雅黑", 10, "bold"),
-        #                fg="#FF5722").pack()
 
-        # --- STEP 4 & 5 ---
-        hk_frame = tk.Frame(self.root);
-        hk_frame.pack(pady=5)
-        self.hk_ocr_entry = tk.Entry(hk_frame, width=8, justify='center');
-        self.hk_ocr_entry.insert(0, "f1");
-        self.hk_ocr_entry.grid(row=0, column=0, padx=5)
-        self.hk_next_entry = tk.Entry(hk_frame, width=8, justify='center');
-        self.hk_next_entry.insert(0, "f2");
-        self.hk_next_entry.grid(row=0, column=1, padx=5)
-        tk.Button(self.root, text="💾 应用热键", command=self.update_hotkeys).pack()
-
-        self.btn_run = tk.Button(self.root, text="【 F1：启动全自动任务 】", bg="#4CAF50", fg="white",
+        self.btn_run = tk.Button(self.root, text="【启动全自动任务 】", bg="#4CAF50", fg="white",
                                  font=("微软雅黑", 12, "bold"), height=2, command=self.start_automation)
         self.btn_run.pack(fill="x", padx=40, pady=5)
         tk.Button(self.root, text="紧急停止 (Esc)", bg="#f44336", fg="white", command=self.stop_task).pack(fill="x",
@@ -136,7 +129,7 @@ class OCRApp:
         fix_frame = tk.Frame(self.root);
         fix_frame.pack(pady=5)
         btns = [("题目区", self.select_roi), ("答案区", self.select_answer_roi), ("输入框", self.select_ai_input),
-                ("发送键", self.select_ai_send), ("下一题", self.select_next_btn), ("归位点", self.select_home_pos)]
+                ("发送键", self.select_ai_send), ("下一题", self.select_next_btn)]
         for i, (name, cmd) in enumerate(btns): tk.Button(fix_frame, text=name, width=8, command=cmd).grid(row=i // 3,
                                                                                                           column=i % 3,
                                                                                                           padx=2,
@@ -150,15 +143,32 @@ class OCRApp:
         except:
             step_delay = 0.3
 
-        pyautogui.moveTo(pos[0], pos[1], duration=step_delay)  # 平滑移动
+        self.log(f"移动到: ({int(pos[0])}, {int(pos[1])})")
+
+        pyautogui.moveTo(pos[0], pos[1], duration=step_delay)
         time.sleep(step_delay)
+
+        self.log("鼠标按下")
         pyautogui.mouseDown()
         time.sleep(0.05)
+
+        self.log("鼠标抬起")
         pyautogui.mouseUp()
         time.sleep(step_delay)
 
     # --- 核心流程 ---
     def start_automation(self):
+        if self.config_loaded:
+            confirm = messagebox.askokcancel(
+                "加载历史配置",
+                "检测到上次保存的坐标配置。\n\n"
+                "请确认当前刷题窗口位置与上次一致。\n"
+                "如果窗口发生移动，请重新进行坐标初始化。\n\n"
+                "是否继续启动？"
+            )
+            if not confirm:
+                self.log("用户取消启动。")
+                return
         if self.is_running: return
         self.is_running = True
         self.stop_requested = False
@@ -200,9 +210,6 @@ class OCRApp:
                     self.log(f"检测到停止词: {word}")
                     if self.stop_on_word_var.get():
                         return False
-
-
-
 
             match = re.search(r'([A-H])', text.upper())
             if match:
@@ -292,7 +299,6 @@ class OCRApp:
             pyautogui.hotkey('ctrl', 'v')
             time.sleep(0.2)
             self.human_click(self.ai_send_pos)
-            if self.user_home_pos: pyautogui.moveTo(self.user_home_pos)
 
         # 3. 等待回答
         try:
@@ -331,13 +337,13 @@ class OCRApp:
             click_interval = 2.0
 
         self.log("执行下一题连点...")
-        self.human_click(self.next_btn_pos)  # 第一次点击
-        time.sleep(click_interval)  # 等待间隔
-        self.human_click(self.next_btn_pos)  # 第二次点击
-
-        # 归位鼠标方便观察
-        self.root.update()
-        pyautogui.moveTo(self.btn_run.winfo_rootx() + 50, self.btn_run.winfo_rooty() + 20, duration=0.5)
+        # 第一次点击（提交答案）
+        self.human_click(self.next_btn_pos)
+        # ⭐ 截图
+        self.save_question_screenshot()
+        time.sleep(click_interval)
+        # 第二次点击（真正翻页）
+        self.human_click(self.next_btn_pos)
 
     def get_ai_answer_text(self):
         if not self.answer_roi: return None
@@ -348,50 +354,173 @@ class OCRApp:
         result = ocr.ocr(shot, cls=False)
         if result and result[0]:
             raw_ans = "".join([line[1][0] for line in result[0]]).upper()
-            return "".join(re.findall(r'[A-H]', raw_ans))
+            self.log(f"答案区OCR原文: {raw_ans}")
+            parsed = "".join(re.findall(r'[A-H]', raw_ans))
+            self.log(f"解析后答案: {parsed}")
+            return parsed
         return None
 
     def stop_task(self):
         self.stop_requested = True; self.is_running = False
 
-    def update_hotkeys(self):
-        keyboard.unhook_all()
-        keyboard.add_hotkey(self.hk_ocr_entry.get().strip(), self.start_automation)
-        keyboard.add_hotkey(self.hk_next_entry.get().strip(), self.action_next_question)
-        keyboard.add_hotkey('esc', self.stop_task)
+    def save_config(self):
+        data = {
+            "app_version": APP_VERSION,
+            "roi": self.roi,
+            "answer_roi": self.answer_roi,
+            "ai_input_pos": self.ai_input_pos,
+            "ai_send_pos": self.ai_send_pos,
+            "next_btn_pos": self.next_btn_pos
+        }
 
-    def start_hotkey_listener(self):
-        threading.Thread(target=self.update_hotkeys, daemon=True).start()
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+
+        self.log("坐标配置已保存。")
+
+    def validate_config(self, data):
+        # 检查版本号
+        if data.get("app_version") != APP_VERSION:
+            self.log("配置版本不匹配，已忽略旧配置。")
+            return False
+        try:
+            required_keys = [
+                "roi",
+                "answer_roi",
+                "ai_input_pos",
+                "ai_send_pos",
+                "next_btn_pos"
+            ]
+
+            for key in required_keys:
+                if key not in data:
+                    return False
+
+            # 检查 roi
+            if not isinstance(data["roi"], list) or len(data["roi"]) != 4:
+                return False
+
+            if not isinstance(data["answer_roi"], list) or len(data["answer_roi"]) != 4:
+                return False
+
+            # 检查点位
+            for key in ["ai_input_pos", "ai_send_pos", "next_btn_pos"]:
+                if not isinstance(data[key], list) or len(data[key]) != 2:
+                    return False
+
+            return True
+
+        except:
+            return False
+
+    def load_config(self):
+        if not os.path.exists(CONFIG_FILE):
+            return
+
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not self.validate_config(data):
+                self.log("检测到配置文件，但内容无效，已忽略。")
+                return
+
+            self.roi = tuple(data["roi"])
+            self.answer_roi = tuple(data["answer_roi"])
+            self.ai_input_pos = tuple(data["ai_input_pos"])
+            self.ai_send_pos = tuple(data["ai_send_pos"])
+            self.next_btn_pos = tuple(data["next_btn_pos"])
+
+            self.config_loaded = True
+            self.log("成功加载历史坐标配置。")
+
+        except Exception as e:
+            self.log(f"加载配置失败: {e}")
 
     # --- 选择逻辑 (省略，代码同前) ---
     def select_roi(self):
-        s = RegionSelector(self.root, "框选题目区"); self.root.wait_window(
-            s.win); self.roi = s.selection if not s.cancelled else self.roi; return not s.cancelled
+        s = RegionSelector(self.root, "框选题目区")
+        self.root.wait_window(s.win)
+
+        if not s.cancelled:
+            self.roi = s.selection
+            self.save_config()
+
+        return not s.cancelled
 
     def select_answer_roi(self):
-        s = RegionSelector(self.root, "框选答案区"); self.root.wait_window(
-            s.win); self.answer_roi = s.selection if not s.cancelled else self.answer_roi; return not s.cancelled
+        s = RegionSelector(self.root, "框选答案区")
+        self.root.wait_window(s.win)
+
+        if not s.cancelled:
+            self.answer_roi = s.selection
+            self.save_config()
+
+        return not s.cancelled
 
     def select_ai_input(self):
-        p = PointSelector(self.root, "点击输入框"); self.root.wait_window(
-            p.win); self.ai_input_pos = p.pos if not p.cancelled else self.ai_input_pos; return not p.cancelled
+        p = PointSelector(self.root, "点击输入框")
+        self.root.wait_window(p.win)
+
+        if not p.cancelled:
+            self.ai_input_pos = p.pos
+            self.save_config()
+
+        return not p.cancelled
 
     def select_ai_send(self):
-        p = PointSelector(self.root, "点击发送键"); self.root.wait_window(
-            p.win); self.ai_send_pos = p.pos if not p.cancelled else self.ai_send_pos; return not p.cancelled
+        p = PointSelector(self.root, "点击发送键")
+        self.root.wait_window(p.win)
+
+        if not p.cancelled:
+            self.ai_send_pos = p.pos
+            self.save_config()
+
+        return not p.cancelled
 
     def select_next_btn(self):
-        p = PointSelector(self.root, "点击下一题点"); self.root.wait_window(
-            p.win); self.next_btn_pos = p.pos if not p.cancelled else self.next_btn_pos; return not p.cancelled
+        p = PointSelector(self.root, "点击下一题点")
+        self.root.wait_window(p.win)
 
-    def select_home_pos(self):
-        p = PointSelector(self.root, "点击归位点"); self.root.wait_window(
-            p.win); self.user_home_pos = p.pos if not p.cancelled else self.user_home_pos; return not p.cancelled
+        if not p.cancelled:
+            self.next_btn_pos = p.pos
+            self.save_config()
+
+        return not p.cancelled
 
     def full_init(self):
         for f in [self.select_roi, self.select_answer_roi, self.select_ai_input, self.select_ai_send,
-                  self.select_next_btn, self.select_home_pos]:
+                  self.select_next_btn]:
             if not f(): break
+
+    def save_question_screenshot(self):
+        if not self.roi:
+            return
+
+        x1, y1, x2, y2 = self.roi
+
+        # 生成文件夹名（YYYYMM）
+        now = datetime.now()
+        folder_name = now.strftime("%Y%m")
+
+        if not os.path.exists(folder_name):
+            os.makedirs(folder_name)
+
+        # 文件名（YYYYMMDD_HHMMSS.png）
+        filename = now.strftime("%Y%m%d_%H%M%S.png")
+        file_path = os.path.join(folder_name, filename)
+
+        with mss.mss() as sct:
+            shot = sct.grab({
+                "left": int(x1),
+                "top": int(y1),
+                "width": int(x2 - x1),
+                "height": int(y2 - y1)
+            })
+
+            mss.tools.to_png(shot.rgb, shot.size, output=file_path)
+
+        self.log(f"题目截图已保存: {file_path}")
 
 
 if __name__ == "__main__":
