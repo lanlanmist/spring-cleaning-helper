@@ -41,7 +41,7 @@ scrcpy -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake
 建议使用上述命令，包含连接画面置顶，关闭屏幕，不自动锁屏。可按需调整。
 
 ```cmd
-scrcpy -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake -m 0 --video-bit-rate 30M --max-fps 60  -s 46HDU19821003245 --always-on-top --turn-screen-off --stay-awake -m 0 --video-bit-rate 30M --max-fps 60"
+scrcpy -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake -m 0 --video-bit-rate 30M --max-fps 60  -s "YOUR DEVICE ID" --always-on-top --turn-screen-off --stay-awake -m 0 --video-bit-rate 30M --max-fps 60"
 ```
 
 或者使用上述命令，极致色彩。
