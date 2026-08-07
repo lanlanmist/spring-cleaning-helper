@@ -1,0 +1,9 @@
+# 直接依赖（本项目代码实际 import 的包），版本为开发验证环境
+paddleocr==2.6.1.2
+paddlepaddle==2.6.2
+numpy==1.23.5
+Pillow==11.3.0
+mss==10.1.0
+pyautogui==0.9.54
+pyperclip==1.11.0
+keyboard==0.13.5    # 可选：全局 Esc 紧急停止

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 运行时生成
+params.json
+screenshots/
+paddle_models/
+
+# 打包产物
+build/
+dist/
+*.spec
+app.ico
+build_log.txt
+
+# adb/ 目录内置 adb + scrcpy-win64-v3.3.4 驱动，随仓库发布，不做忽略
+
+# 调试素材
+screenPNG/
+_*.py
+_*.npy
+_*.png
