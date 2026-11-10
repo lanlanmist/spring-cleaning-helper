@@ -40,7 +40,7 @@ WORD_CORRECT_ANSWER = "正确答案"  # 判分页答案解析中的正确答案
 WORD_LOADING = "加载中"        # 判分页刚出现时残留的加载提示（截图需等它消失）
 
 # 默认参数（毫秒）
-DEFAULT_PROMPT = "请给出这道题的答案。只给出选项，不用给出解析。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开：\n"
+DEFAULT_PROMPT = "请给出这道题的答案。只给出选项，不用给出解析。不需要给出任何分析过程，只给出答案选项。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开：\n"
 DEFAULT_AI_WAIT_MS = 10000     # 等待外部 AI 作答
 DEFAULT_CLICK_RESPONSE_MS = 2000  # 点击按钮后等待页面响应
 DEFAULT_STEP_MS = 300          # 操作间微延迟
@@ -54,6 +54,15 @@ MAX_CONSECUTIVE_FAILURES = 5   # 连续识别/截图失败多少次后自动停�
 MAX_PREVIEW_FAILURES = 10      # 预览连续截图失败多少次后判定设备断开
 MAX_LONG_Q_SCROLLS = 3         # 长题滚动拼接的最大滚动次数
 SCROLL_SETTLE_S = 0.8          # 每次滚动后等待页面稳定的秒数
+
+# AI 对话区自动滚动到页末（应对回答后不自动滚到页底的 AI 网页）
+AI_SCROLL_CLICKS = 5           # 滚轮向下滚动次数
+AI_SCROLL_UNITS = 300          # 每次滚动量（Windows 滚轮单位）
+DEFAULT_SCROLL_SETTLE_MS = 1000  # 全部滚动结束后、OCR 识别前的等待（毫秒，界面可改）
+
+# AI 答案轮询重试（固定等待期满后答案可能尚未生成，如深度检索类 AI）
+AI_ANSWER_RETRY_S = 15         # 固定等待期满后，最多再轮询等待的秒数
+AI_ANSWER_POLL_S = 1.5         # 两次轮询识别的间隔秒数
 
 print("正在热机 PaddleOCR...")
 _model_kwargs = {}
