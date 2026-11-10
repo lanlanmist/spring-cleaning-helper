@@ -1,7 +1,7 @@
 """大扫除小助手 V3.0 主窗口。
 
 手机端操作全部走 adb（截图 + tap），元素位置运行时 OCR 自动定位，不落盘；
-外部 AI 窗口（答案区/输入框/发送键）仅运行期标定，关闭即清除；
+外部 AI 窗口（AI 页面区/输入框/发送键）仅运行期标定，关闭即清除；
 仅 Prompt 与延时参数持久化到 params.json。
 """
 
@@ -25,8 +25,11 @@ import importlib.util
 
 from adb_service import AdbService, AdbError
 from config import (
-    ADB_TIMEOUT, APP_VERSION, DEFAULT_AI_WAIT_MS, DEFAULT_CLICK_RESPONSE_MS,
-    DEFAULT_PROMPT, DEFAULT_QUESTION_LIMIT, DEFAULT_STEP_MS,
+    ADB_TIMEOUT, AI_ANSWER_POLL_S, AI_ANSWER_RETRY_S,
+    AI_SCROLL_CLICKS, AI_SCROLL_UNITS,
+    APP_VERSION, DEFAULT_AI_WAIT_MS, DEFAULT_CLICK_RESPONSE_MS,
+    DEFAULT_PROMPT, DEFAULT_QUESTION_LIMIT, DEFAULT_SCROLL_SETTLE_MS,
+    DEFAULT_STEP_MS,
     MAX_CONSECUTIVE_FAILURES, MAX_LONG_Q_SCROLLS, MAX_PREVIEW_FAILURES,
     PARAMS_FILE, PREVIEW_INTERVAL, PREVIEW_WIDTH, SCROLL_SETTLE_S,
     SHOT_DIR,
@@ -46,6 +49,13 @@ STATE_RESULT = "result"         # 已判分，出现"下一题"
 STATE_GROUP_END = "group_end"   # 组结束，出现"再来一组"
 STATE_UNKNOWN = "unknown"
 
+# AI 全页面提纯答案用的行级正则
+AI_PAGE_OPTION_RE = re.compile(r"^\s*[A-H]\s*[.。:：]")            # "A. xxx" 选项行
+AI_PAGE_LETTER_RE = re.compile(                                    # 独立答案字母行："A"、"A,C"
+    r"^\s*([A-H](?:\s*[,，、]\s*[A-H])*)\s*[.。]?\s*$")
+AI_PAGE_ANSWER_WORD_RE = re.compile(                               # "答案：A" 行
+    r"答案\s*[:：]?\s*([A-H](?:\s*[,，、]\s*[A-H])*)")
+
 
 class OCRApp:
     def __init__(self):
@@ -61,9 +71,10 @@ class OCRApp:
         self.device_resolution = None
 
         # --- 运行期标定（仅内存，关闭即清除） ---
-        self.answer_roi = None       # 外部 AI 回答区（PC 屏幕坐标）
+        self.ai_page_roi = None      # 整个外部 AI 对话页面（PC 屏幕坐标）
         self.ai_input_pos = None     # 外部 AI 输入框
         self.ai_send_pos = None      # 外部 AI 发送键
+        self.scroll_pos = None       # AI 对话区滚轮滚动位置
 
         # --- 任务状态 ---
         self.stop_event = threading.Event()
@@ -139,12 +150,24 @@ class OCRApp:
         tk.Button(cal_btns, text="一键顺序标定", width=14, fg="#009688",
                   font=("微软雅黑", 9, "bold"),
                   command=self.calibrate_all).grid(row=0, column=0, padx=4)
-        tk.Button(cal_btns, text="重新框选答案区", width=14,
-                  command=self.select_answer_roi).grid(row=0, column=1, padx=4)
+        tk.Button(cal_btns, text="重新框选AI页面", width=14,
+                  command=self.select_ai_page).grid(row=0, column=1, padx=4)
         tk.Button(cal_btns, text="重新点选输入框", width=14,
                   command=self.select_ai_input).grid(row=0, column=2, padx=4)
         tk.Button(cal_btns, text="重新点选发送键", width=14,
                   command=self.select_ai_send).grid(row=0, column=3, padx=4)
+        # 自动滚动到页末：部分 AI 回答后不会自动滚到页底，需滚轮翻到页末才能露出答案
+        scroll_row = tk.Frame(cal_frame)
+        scroll_row.pack(pady=(0, 3))
+        self.auto_scroll_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(scroll_row, text="自动滚动到页末",
+                       variable=self.auto_scroll_var,
+                       command=self._save_params).pack(side="left", padx=4)
+        tk.Button(scroll_row, text="设定滚动位置", width=12,
+                  command=self.select_scroll_pos).pack(side="left", padx=4)
+        tk.Label(scroll_row, fg="grey", font=("微软雅黑", 8),
+                 text="（勾选后：等 AI 作答完毕，鼠标移至此位置向下滚动，再读取答案）"
+                 ).pack(side="left", padx=4)
         self.calib_status = tk.Label(cal_frame, text="", fg="#795548",
                                      font=("微软雅黑", 9))
         self.calib_status.pack(pady=2)
@@ -197,6 +220,13 @@ class OCRApp:
             row=3, column=0, columnspan=2, sticky="w", pady=(5, 0), padx=8)
         tk.Label(grid, text="（提交后存到以启动时间命名的文件夹）", fg="grey",
                  font=("微软雅黑", 8)).grid(row=3, column=2, columnspan=2)
+
+        tk.Label(grid, text="滚动后延时(ms):").grid(row=4, column=0, pady=5)
+        self.delay_scroll_settle = tk.Entry(grid, width=8, justify="center")
+        self.delay_scroll_settle.grid(row=4, column=1)
+        self.delay_scroll_settle.bind("<FocusOut>", lambda e: self._save_params())
+        tk.Label(grid, text="（自动滚动全部结束后，等待此时长再 OCR 识别答案）", fg="grey",
+                 font=("微软雅黑", 8)).grid(row=4, column=2, columnspan=2)
 
     def _build_control_ui(self, parent):
         # --- 彩虹提示 ---
@@ -260,9 +290,12 @@ class OCRApp:
         self.delay_click_response.insert(0, str(params.get(
             "delay_click_response_ms", DEFAULT_CLICK_RESPONSE_MS)))
         self.delay_step.insert(0, str(params.get("delay_step_ms", DEFAULT_STEP_MS)))
+        self.delay_scroll_settle.insert(0, str(params.get(
+            "delay_scroll_settle_ms", DEFAULT_SCROLL_SETTLE_MS)))
         self.question_limit.insert(0, str(params.get("question_limit",
                                                      DEFAULT_QUESTION_LIMIT)))
         self.save_shots_var.set(bool(params.get("save_result_screens", False)))
+        self.auto_scroll_var.set(bool(params.get("auto_scroll_bottom", False)))
         self.log("参数已加载。")
 
     def _save_params(self):
@@ -273,9 +306,12 @@ class OCRApp:
             "delay_click_response_ms": self._int_of(self.delay_click_response,
                                                     DEFAULT_CLICK_RESPONSE_MS),
             "delay_step_ms": self._int_of(self.delay_step, DEFAULT_STEP_MS),
+            "delay_scroll_settle_ms": self._int_of(self.delay_scroll_settle,
+                                                   DEFAULT_SCROLL_SETTLE_MS),
             "question_limit": self._int_of(self.question_limit,
                                            DEFAULT_QUESTION_LIMIT),
             "save_result_screens": bool(self.save_shots_var.get()),
+            "auto_scroll_bottom": bool(self.auto_scroll_var.get()),
         }
         try:
             with open(PARAMS_FILE, "w", encoding="utf-8") as f:
@@ -413,18 +449,21 @@ class OCRApp:
     # AI 窗口标定（仅内存）
     # ==================================================================
     def _update_calib_status(self):
-        roi = "已标定" if self.answer_roi else "未标定"
+        roi = "已标定" if self.ai_page_roi else "未标定"
         inp = "已标定" if self.ai_input_pos else "未标定"
         snd = "已标定" if self.ai_send_pos else "未标定"
+        scr = "已标定" if self.scroll_pos else "未标定"
         self.calib_status.config(
-            text=f"答案区: {roi}    输入框: {inp}    发送键: {snd}")
+            text=f"AI页面: {roi}    输入框: {inp}    发送键: {snd}"
+                 f"    滚动位置: {scr}")
 
-    def select_answer_roi(self):
-        s = RegionSelector(self.root, "框选外部 AI 的回答区")
+    def select_ai_page(self):
+        s = RegionSelector(self.root,
+                           "框选整个外部 AI 对话页面（含题目气泡与回答区域）")
         self.root.wait_window(s.win)
         if not s.cancelled:
-            self.answer_roi = s.selection
-            self.log(f"AI 回答区已标定：{tuple(int(v) for v in s.selection)}")
+            self.ai_page_roi = s.selection
+            self.log(f"AI 页面区已标定：{tuple(int(v) for v in s.selection)}")
         self._update_calib_status()
         return not s.cancelled
 
@@ -446,11 +485,20 @@ class OCRApp:
         self._update_calib_status()
         return not p.cancelled
 
+    def select_scroll_pos(self):
+        p = PointSelector(self.root, "点击 AI 对话区中执行滚轮滚动的位置")
+        self.root.wait_window(p.win)
+        if not p.cancelled:
+            self.scroll_pos = p.pos
+            self.log(f"AI 对话区滚动位置已标定：{p.pos}")
+        self._update_calib_status()
+        return not p.cancelled
+
     def calibrate_all(self):
-        """一键标定：按 答案区 → 输入框 → 发送键 顺序依次设定；
+        """一键标定：按 AI 页面区 → 输入框 → 发送键 顺序依次设定；
         任意一步取消则中止后续步骤（已完成的保留）。"""
-        self.log("一键标定开始：① 请框选 AI 回答区")
-        if not self.select_answer_roi():
+        self.log("一键标定开始：① 请框选整个 AI 对话页面")
+        if not self.select_ai_page():
             self.log("一键标定已中止。")
             return
         self.log("一键标定：② 请点击 AI 输入框")
@@ -461,7 +509,15 @@ class OCRApp:
         if not self.select_ai_send():
             self.log("一键标定已中止。")
             return
-        self.log("一键标定完成，三项均已就绪。")
+        # 滚动位置仅在勾选“自动滚动到页末”时才纳入一键标定
+        if self.auto_scroll_var.get():
+            self.log("一键标定：④ 请点击 AI 对话区的滚动位置")
+            if not self.select_scroll_pos():
+                self.log("一键标定已中止。")
+                return
+            self.log("一键标定完成，四项均已就绪。")
+        else:
+            self.log("一键标定完成，三项均已就绪。")
 
     # ==================================================================
     # 启停控制
@@ -472,8 +528,12 @@ class OCRApp:
         if not self.device_serial:
             self.log("请先连接 adb 设备。")
             return
-        if not (self.answer_roi and self.ai_input_pos and self.ai_send_pos):
+        if not (self.ai_page_roi and self.ai_input_pos and self.ai_send_pos):
             self.log("请先完成 STEP 2 的三项 AI 窗口标定。")
+            return
+        if self.auto_scroll_var.get() and not self.scroll_pos:
+            self.log("已勾选“自动滚动到页末”，请先点“设定滚动位置”，"
+                     "或取消勾选。")
             return
 
         self.is_running = True
@@ -712,8 +772,13 @@ class OCRApp:
         if self._interruptible_sleep(wait_ms / 1000.0):
             return False
 
-        # 3. 读取 AI 回答
-        answer = self._read_ai_answer()
+        # 2.5 部分 AI 回答后不会自动滚到页末：先滚轮向下翻到页底露出答案
+        if self.auto_scroll_var.get() and self.scroll_pos:
+            if self._scroll_ai_to_bottom():
+                return False
+
+        # 3. 读取 AI 回答（带轮询重试，应对答案生成慢的 AI）
+        answer = self._wait_ai_answer(set(option_pos))
         if not answer:
             self.log("未读取到有效答案，本轮跳过。")
             return False
@@ -895,20 +960,138 @@ class OCRApp:
         pyautogui.click(*self.ai_send_pos)
         self.log("题目已发送给外部 AI。")
 
-    def _read_ai_answer(self):
-        """截图外部 AI 回答区并 OCR，提取 A-H 字母。"""
-        if not self.answer_roi:
+    def _scroll_ai_to_bottom(self):
+        """鼠标移到 AI 对话区滚动位置，滚轮向下滚动到页末。
+
+        部分 AI 网页回答后不会自动滚到页底，答案不在可见区域内，
+        需先滚动暴露答案再读取。返回 True 表示期间被要求停止。
+        """
+        x, y = self.scroll_pos
+        pyautogui.moveTo(x, y, duration=0.2)
+        for _ in range(AI_SCROLL_CLICKS):
+            if self.stop_event.is_set():
+                return True
+            pyautogui.scroll(-AI_SCROLL_UNITS, x=x, y=y)
+            if self._interruptible_sleep(0.05):
+                return True
+        # 全部滚动结束后等待页面稳定，再进行 OCR 识别
+        settle_ms = self._int_of(self.delay_scroll_settle,
+                                 DEFAULT_SCROLL_SETTLE_MS)
+        self.log(f"已滚动 AI 对话区到页末，等待 {settle_ms}ms 后识别答案 ...")
+        return self._interruptible_sleep(settle_ms / 1000.0)
+
+    def _read_ai_answer(self, valid_letters=None, dump=False):
+        """截图整个 AI 页面并 OCR，从干扰中提纯答案字母。
+
+        AI 会在答案前后额外说话（“已完成分析”“需要我帮你整理…吗？”、
+        复制/点赞等图标行、推荐追问气泡），题目气泡内又有 A./B./C. 开头的
+        选项行和大量英文干扰（Git/final 等），不能全文直接抓字母：
+        1. 用已发送 Prompt 的开头文字定位当前题目气泡顶部（取页面最后一次
+           出现，跳过历史轮次的气泡）；
+        2. 气泡顶部以下、最低的选项前缀行视为气泡底部，答案只可能在其下方；
+        3. 气泡下方取第一条“独立答案字母行”（如 "A"、"A,C"），其次兜底
+           “答案：X”显式行；候选必须只由本题有效选项字母构成，
+           排除孤立英文单词类误识别；
+        4. 页面过长气泡已滚出屏幕时（找不到 Prompt），改取页面最下方
+           一条独立答案字母行（即最近一次回答）。
+        """
+        if not self.ai_page_roi:
             return None
-        x1, y1, x2, y2 = (int(v) for v in self.answer_roi)
+        x1, y1, x2, y2 = (int(v) for v in self.ai_page_roi)
         with mss.mss() as sct:
             shot = np.array(sct.grab({"left": x1, "top": y1,
                                       "width": x2 - x1, "height": y2 - y1}))[:, :, :3]
         result = ocr.ocr(shot, cls=False)
         if not result or not result[0]:
             return None
-        raw = "".join(line[1][0] for line in result[0]).upper()
-        self.log(f"AI 回答区 OCR 原文：{raw}")
-        return "".join(re.findall(r"[A-H]", raw))
+        lines = [(self._box_center(line[0])[1], line[1][0])
+                 for line in result[0]]           # [(行中心 y, 文本), ...]
+
+        prompt_head = self.prompt_text.get("1.0", tk.END).strip()[:8]
+        marker_y = None
+        if prompt_head:
+            hit = [cy for cy, t in lines if prompt_head in t.replace(" ", "")]
+            if hit:
+                marker_y = max(hit)               # 当前题目气泡顶部
+
+        floor_y = marker_y
+        if marker_y is not None:
+            opt_ys = [cy for cy, t in lines
+                      if cy > marker_y and AI_PAGE_OPTION_RE.match(t)]
+            if opt_ys:
+                floor_y = max(opt_ys)             # 气泡底部 = 最低选项行
+
+        ordered = sorted(lines, key=lambda lt: lt[0])
+        if floor_y is not None:
+            cands = [t for cy, t in ordered if cy > floor_y]   # 只看气泡下方
+        else:
+            cands = [t for cy, t in ordered]                   # 气泡离屏：全页查找
+
+        def _scan(strict):
+            """一轮扫描：strict 要求整行仅由有效选项字母构成（防英文单词
+            误识别）；宽松轮则取有效选项交集。气泡可见返回最上方命中行，
+            离屏返回最下方（最近一次）命中行。"""
+            found = None
+            for t in cands:
+                up = t.upper()
+                m = AI_PAGE_LETTER_RE.match(up) or AI_PAGE_ANSWER_WORD_RE.search(up)
+                if not m:
+                    continue
+                letters = re.sub(r"[,，、\s]", "", m.group(1))
+                if valid_letters:
+                    if strict:
+                        if not set(letters) <= set(valid_letters):
+                            continue                           # 含非选项字母，判为干扰
+                    else:
+                        letters = "".join(c for c in letters
+                                          if c in valid_letters)
+                        if not letters:
+                            continue
+                found = (t, letters)
+                if floor_y is not None:
+                    return found
+            return found
+
+        hit = _scan(True)
+        if hit is None:
+            hit = _scan(False)
+            if hit:
+                self.log(f"答案行含未识别选项字母，宽松取交集：{hit[1]}")
+        if hit:
+            t, letters = hit
+            if floor_y is None:
+                self.log(f"题目气泡不在画面内，取页面最下方答案行：{t}")
+            else:
+                self.log(f"AI 页面答案行原文：{t}")
+            return letters
+        if dump:   # 最终失败时转储页面识别文本，便于排查
+            self.log("AI 页面 OCR 行转储：" +
+                     " | ".join(t for _, t in ordered)[:300])
+        return None
+
+    def _wait_ai_answer(self, valid_letters):
+        """轮询读取 AI 答案：固定等待期满时页面可能仍未生成完答案
+        （深度检索类 AI 普遍 15 秒以上），每 AI_ANSWER_POLL_S 秒重试一次，
+        最长再等 AI_ANSWER_RETRY_S 秒；勾选“自动滚动到页末”时每次重试前
+        重新滚动，保证持续变长的答案保持在画面内。"""
+        deadline = time.time() + AI_ANSWER_RETRY_S
+        retries = 0
+        while not self.stop_event.is_set():
+            answer = self._read_ai_answer(valid_letters)
+            if answer:
+                if retries:
+                    self.log(f"答案在第 {retries + 1} 次重试识别中出现。")
+                return answer
+            if time.time() >= deadline:
+                break
+            retries += 1
+            self.log(f"答案尚未出现在页面上，{AI_ANSWER_POLL_S} 秒后重试识别…")
+            if self._interruptible_sleep(AI_ANSWER_POLL_S):
+                return None
+            if self.auto_scroll_var.get() and self.scroll_pos:
+                self._scroll_ai_to_bottom()
+        self.log(f"重试 {retries} 次仍未读到答案，转储页面文本辅助排查。")
+        return self._read_ai_answer(valid_letters, dump=True)
 
     # ==================================================================
     # 全局 Esc 与关闭
