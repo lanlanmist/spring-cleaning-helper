@@ -14,11 +14,18 @@
 
 import re
 
+# 选项字母竖带：选项字母列横向固定在屏幕左侧（约占宽度 20%），纵向随
+# 题目/选项长度延伸。单独裁出这一条竖带做 OCR，得到的 A/B/C… 序列比
+# 全屏识别更稳（长题时尤为明显）。
+OPTION_BAND_RATIO = 0.20
+# 竖带内只取“纯字母”框（"A" / "A." / "A:"），选项正文另行归属
+# 分隔符兼容半角 . :、全角。．：：五种写法（OCR 常混用）
+SLOT_LETTER_RE = re.compile(r'^\s*([A-H])\s*[.。．:：]?\s*$')
 # 宽松前缀：行首 "A." 后可能跟选项内容（前缀与内容同框）；
-# OCR 常把 "." 误识为 ":"，一并容忍
-OPTION_PREFIX_RE = re.compile(r'^\s*([A-H])\s*[.。:：]')
+# OCR 常把 "." 误识为 ":" 或全角符号，一并容忍
+OPTION_PREFIX_RE = re.compile(r'^\s*([A-H])\s*[.。．:：]')
 # 严格前缀：整个框只是 "A."（前缀与内容分框）
-OPTION_PREFIX_STRICT_RE = re.compile(r'^\s*([A-H])\s*[.。:：]\s*$')
+OPTION_PREFIX_STRICT_RE = re.compile(r'^\s*([A-H])\s*[.。．:：]\s*$')
 # 水印特征：完整日期 2026-08-04、5 位以上数字串、残缺日期片段 08-04 21:29
 WATERMARK_RE = re.compile(
     r'(20\d{2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{1,2}'
@@ -135,7 +142,7 @@ def _is_option_like(r, band_right):
     """竖带内且形如 "X." 前缀的行（选项起点）。"""
     text = r["text"].strip()
     return (r["x0"] <= band_right
-            and re.match(r'^\s*[A-H]\s*[.。:：]', text) is not None)
+            and re.match(r'^\s*[A-H]\s*[.。．:：]', text) is not None)
 
 
 def _sequential_options(zone, frame_w):
@@ -158,16 +165,66 @@ def _sequential_options(zone, frame_w):
     return options
 
 
-def parse_question_page(ocr_lines, frame_w, frame_h):
+def extract_slots_from_band(band_lines):
+    """从左侧字母竖带的 OCR 结果提取选项槽位。
+
+    band_lines 是“只裁了左侧 OPTION_BAND_RATIO 宽度”的图像的识别结果，
+    裁剪只发生在横向，因此 y 坐标与原图一致，可直接用作点击行。
+    返回 [(字母, 行中心 y), ...]，按 y 升序；同一字母重复出现时取最靠上
+    的一个（竖带内真正的槽位总是在该字母所在行的顶部）。
+    """
+    found = {}
+    for box, text in band_lines:
+        m = SLOT_LETTER_RE.match(text.strip())
+        if not m:
+            continue
+        cy = (box[0][1] + box[2][1]) / 2
+        letter = m.group(1)
+        if letter not in found or cy < found[letter]:
+            found[letter] = cy
+    return sorted(found.items(), key=lambda kv: kv[1])
+
+
+def _options_from_slots(slot_hint, content_rows, band_extra, frame_w, frame_h):
+    """按竖带槽位组装选项：槽位给字母与点击 y，文本就近归属。
+
+    竖带宽度内的行多数是字母/水印残留，只有宽度足够大的行（选项正文因
+    排版紧贴左侧）才作为文本候选，否则会把 "A." 当成选项内容。
+    带 _force 标记的行是从竖带前缀框里截出的正文残段（如 "A. 财产损失"
+    被 OCR 识别成一整框），宽度不可信但文本必须保留。
+    """
+    ys = [y for _, y in slot_hint]
+    gaps = [b - a for a, b in zip(ys, ys[1:])]
+    row_gap = sorted(gaps)[len(gaps) // 2] if gaps else frame_h * 0.09
+    options = {letter: {"text": "", "pos": (frame_w / 2, y)}
+               for letter, y in slot_hint}
+    extra_rows = [r for r in band_extra
+                  if r.get("_force")
+                  or (r["x1"] - r["x0"]) > frame_w * 0.3]
+    for r in content_rows + extra_rows:
+        nearest = min(slot_hint, key=lambda slot: abs(slot[1] - r["y"]))
+        if abs(nearest[1] - r["y"]) <= row_gap * 0.6:
+            info = options[nearest[0]]
+            info["text"] = (info["text"] + " " + r["text"]).strip()
+    for info in options.values():
+        info["text"] = _clean_option_text(info["text"])
+    return options
+
+
+def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
     """解析答题页。
+
+    slot_hint: 左侧字母竖带直读出的槽位 [(字母, y), ...]。提供时跳过
+    “前缀行拟合 + 缺失回填”，直接按槽位归属选项文本——长题或全屏
+    OCR 漏识字母时由调用方补上，比拟合推断更可靠。
 
     返回 (question_text, options)：
       question_text: 题干文本（含题型标签），失败为 None；
       options: {字母: {"text": 选项文本, "pos": (点击x, 点击y)}}。
     """
     clean = [(box, t) for box, t in ocr_lines if not is_noise(t)]
-    # 选项前缀竖带：屏幕左侧约 19% 宽（选项字母排在题型标签正下方）
-    band_right = frame_w * 0.19
+    # 选项前缀竖带：屏幕左侧一段固定宽度（选项字母排在题型标签正下方）
+    band_right = frame_w * OPTION_BAND_RATIO
     rows = group_rows(clean, frame_h * 0.02, band_right)
     if not rows:
         return None, {}
@@ -234,6 +291,9 @@ def parse_question_page(ocr_lines, frame_w, frame_h):
     else:
         zone = [r for r in rows[q_area_end:] if r["y"] < frame_h * 0.75]
     if not zone:
+        if slot_hint:
+            return question_text, _options_from_slots(slot_hint, [], [],
+                                                      frame_w, frame_h)
         return question_text, {}
 
     # --- 按几何列分类：选项前缀竖带 vs 内容列 ---
@@ -256,6 +316,16 @@ def parse_question_page(ocr_lines, frame_w, frame_h):
             band_extra.append(r)
             continue
         content_rows.append(r)
+
+    if slot_hint:
+        # 竖带直读槽位：字母与行位置均可信，不再拟合/回填；
+        # 前缀框里截出的正文残段一并作为文本候选，避免选项文本丢失
+        extra = list(band_extra)
+        for p in prefix_rows:
+            if p["rest"]:
+                extra.append(dict(p["row"], text=p["rest"], _force=True))
+        return question_text, _options_from_slots(slot_hint, content_rows,
+                                                  extra, frame_w, frame_h)
 
     if not prefix_rows:
         # 完全无前缀（如纯判断题）：按顺序兜底分配
