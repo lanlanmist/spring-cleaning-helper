@@ -1,4 +1,4 @@
-"""大扫除小助手 V3.0 主窗口。
+"""大扫除小助手 V3.2 主窗口。
 
 手机端操作全部走 adb（截图 + tap），元素位置运行时 OCR 自动定位，不落盘；
 外部 AI 窗口（AI 页面区/输入框/发送键）仅运行期标定，关闭即清除；
@@ -6,10 +6,13 @@
 """
 
 import json
+import logging
 import os
 import re
 import threading
 import time
+from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 
 import mss
 import numpy as np
@@ -27,27 +30,50 @@ from adb_service import AdbService, AdbError
 from config import (
     ADB_TIMEOUT, AI_ANSWER_POLL_S, AI_ANSWER_RETRY_S,
     AI_SCROLL_CLICKS, AI_SCROLL_UNITS,
-    APP_VERSION, DEFAULT_AI_WAIT_MS, DEFAULT_CLICK_RESPONSE_MS,
+    APP_VERSION, BUTTON_TOP_RATIO, DEFAULT_AI_WAIT_MS,
+    DEFAULT_CLICK_RESPONSE_MS,
     DEFAULT_PROMPT, DEFAULT_QUESTION_LIMIT, DEFAULT_SCROLL_SETTLE_MS,
-    DEFAULT_STEP_MS,
+    DEFAULT_STEP_MS, LOG_DIR,
     MAX_CONSECUTIVE_FAILURES, MAX_LONG_Q_SCROLLS, MAX_PREVIEW_FAILURES,
-    PARAMS_FILE, PREVIEW_INTERVAL, PREVIEW_WIDTH, SCROLL_SETTLE_S,
-    SHOT_DIR,
+    PARAMS_FILE, PREVIEW_INTERVAL, PREVIEW_INTERVAL_RUNNING, PREVIEW_WIDTH,
+    SCROLL_SETTLE_S, SHOT_DIR,
     WORD_CORRECT_ANSWER, WORD_FINISH, WORD_LOADING,
     WORD_GROUP_END, WORD_NEXT, WORD_SUBMIT, ocr,
 )
 from gui_selectors import PointSelector, RegionSelector
 from image_clean import remove_watermark
-from quiz_parser import (HINT_WORD, OPTION_PREFIX_RE, QUESTION_MARKER,
-                         TYPE_WORDS, parse_question_page)
+from quiz_parser import (HINT_WORD, OPTION_BAND_RATIO, OPTION_PREFIX_RE,
+                         QUESTION_MARKER, TYPE_WORDS, extract_slots_from_band,
+                         parse_question_page)
 
 pyautogui.FAILSAFE = False
+
+PARAMS_SAVE_DEBOUNCE_MS = 800   # 参数改动合并写入的延迟（毫秒）
 
 STATE_QUESTION = "question"     # 答题页（检测到选项/查看提示）
 STATE_SUBMITTED = "submitted"   # 已选择，出现"确定"
 STATE_RESULT = "result"         # 已判分，出现"下一题"
 STATE_GROUP_END = "group_end"   # 组结束，出现"再来一组"
 STATE_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """一次自动化运行的参数快照。
+
+    工作线程全程只读此对象，不再访问 Tk 控件（Entry / Text / BooleanVar
+    均非线程安全）；运行期间在界面上的改动要到下次启动才生效。
+    """
+
+    prompt: str
+    ai_wait_ms: int
+    click_response_ms: int
+    step_ms: int
+    scroll_settle_ms: int
+    question_limit: int
+    save_shots: bool
+    auto_scroll: bool
+
 
 # AI 全页面提纯答案用的行级正则
 AI_PAGE_OPTION_RE = re.compile(r"^\s*[A-H]\s*[.。:：]")            # "A. xxx" 选项行
@@ -56,9 +82,37 @@ AI_PAGE_LETTER_RE = re.compile(                                    # 独立答�
 AI_PAGE_ANSWER_WORD_RE = re.compile(                               # "答案：A" 行
     r"答案\s*[:：]?\s*([A-H](?:\s*[,，、]\s*[A-H])*)")
 
+_logger = logging.getLogger("spring_cleaning_helper")
+
+
+def _setup_file_logging():
+    """日志同时写入 logs/app-YYYYMMDD.log（按大小滚动）。
+
+    UI 日志区随运行越来越长、重启即丢，排障（尤其是无人值守跑一整晚
+    后中断）只能靠文件日志。
+    """
+    if _logger.handlers:            # 已初始化
+        return _logger
+    _logger.setLevel(logging.INFO)
+    # 不向 root 传播：否则 PaddleOCR 等库配置的 root handler 会把每条
+    # 日志再往控制台打一遍（带一份重复的格式），干扰输出
+    _logger.propagate = False
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        handler = RotatingFileHandler(
+            os.path.join(LOG_DIR, time.strftime("app-%Y%m%d.log")),
+            maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    except OSError:
+        return _logger                # 无法建日志目录时静默降级到仅 UI
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+    _logger.addHandler(handler)
+    return _logger
+
 
 class OCRApp:
     def __init__(self):
+        self._logger = _setup_file_logging()
         self.root = tk.Tk()
         self.root.title(APP_VERSION)
         self.root.geometry("1040x760+400+30")
@@ -80,11 +134,23 @@ class OCRApp:
         self.stop_event = threading.Event()
         self.is_running = False
         self.stats = {"answered": 0}
+        self._worker = None          # 当前自动化线程，用于识别停止/启动竞态
+        self.cfg = None              # 本次运行的参数快照（RunConfig，工作线程只读）
+        self._shot_dir = None        # 本次运行的判分截图目录（None 表示不截图）
+        self._last_result_fp = None  # 上一张判分页指纹，避免同一页重复计数
+        self._answer_ctx = None      # 同一题的 AI 答案与已点击字母（防重复点击）
+        self._last_answer = None     # 上一题我方作答，用于与正确答案对比打日志
+        self._scroll_index = {}      # 长题：字母 -> 相对页面顶部的下滚屏数
+        self._scrolled_down = 0      # 长题：当前已下滚的屏数
+        self._last_state = None      # 上一次页面状态，仅在变化时打日志
+        self._save_job = None        # 参数延迟写入的 after 句柄（去抖用）
 
         # --- 预览线程 ---
         self._preview_stop = threading.Event()
         self._preview_thread = None
-        self._tk_img = None  # 保持引用防止被 GC
+        self._tk_img = None        # 保持引用防止被 GC
+        self._preview_size = None  # (原图宽, 原图高, 画布宽, 画布高) 缓存
+        self._preview_scaled = None  # 与 _preview_size 对应的缩放后尺寸
 
         self._setup_ui()
         self._load_params()
@@ -257,6 +323,7 @@ class OCRApp:
     # 日志（线程安全）
     # ==================================================================
     def log(self, message):
+        self._logger.info(message)
         if threading.current_thread() is threading.main_thread():
             self._append_log(message)
         else:
@@ -299,6 +366,28 @@ class OCRApp:
         self.log("参数已加载。")
 
     def _save_params(self):
+        """调度一次延迟写入：连续输入时合并，避免每敲一键就落盘。"""
+        if self._save_job is not None:
+            try:
+                self.root.after_cancel(self._save_job)
+            except tk.TclError:
+                pass
+        self._save_job = self.root.after(PARAMS_SAVE_DEBOUNCE_MS,
+                                        self._write_params)
+
+    def _flush_params(self):
+        """立即落盘（关闭窗口前调用，避免刚改完就关丢参数）。"""
+        if self._save_job is not None:
+            try:
+                self.root.after_cancel(self._save_job)
+            except tk.TclError:
+                pass
+            self._save_job = None
+        self._write_params()
+
+    def _write_params(self):
+        """原子写入 params.json：先写临时文件再替换，避免留下半截 JSON。"""
+        self._save_job = None
         data = {
             "app_version": APP_VERSION,
             "prompt": self.prompt_text.get("1.0", tk.END).strip(),
@@ -313,11 +402,17 @@ class OCRApp:
             "save_result_screens": bool(self.save_shots_var.get()),
             "auto_scroll_bottom": bool(self.auto_scroll_var.get()),
         }
+        tmp_file = PARAMS_FILE + ".tmp"
         try:
-            with open(PARAMS_FILE, "w", encoding="utf-8") as f:
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
+            os.replace(tmp_file, PARAMS_FILE)
         except OSError as e:
             self.log(f"参数保存失败：{e}")
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                pass
 
     @staticmethod
     def _int_of(entry, default):
@@ -406,6 +501,10 @@ class OCRApp:
     def _preview_loop(self):
         failures = 0
         while not self._preview_stop.is_set():
+            # 自动化运行期间降低取帧频率：adb 截图是串行资源，预览每次抢锁
+            # 都会直接摊在单题耗时上（OCR 与长题滑动期间尤为明显）
+            interval = (PREVIEW_INTERVAL_RUNNING if self.is_running
+                        else PREVIEW_INTERVAL)
             frame = None
             if self.adb_lock.acquire(timeout=0.5):
                 try:
@@ -428,18 +527,28 @@ class OCRApp:
                     self.root.after(0, self._show_preview, frame)
                 except (tk.TclError, RuntimeError):
                     return
-            self._preview_stop.wait(PREVIEW_INTERVAL)
+            self._preview_stop.wait(interval)
 
     def _show_preview(self, frame):
-        img = Image.fromarray(frame)
         # 按画布实际可用区域等比缩放并居中（窗口拉伸时自动适配）
-        self.preview_canvas.update_idletasks()
-        cw = max(1, self.preview_canvas.winfo_width())
-        ch = max(1, self.preview_canvas.winfo_height())
-        scale = min(cw / img.width, ch / img.height)
-        new_w = max(1, int(img.width * scale))
-        new_h = max(1, int(img.height * scale))
-        img = img.resize((new_w, new_h), Image.LANCZOS)
+        cw = self.preview_canvas.winfo_width()
+        ch = self.preview_canvas.winfo_height()
+        if cw <= 1 or ch <= 1:      # 窗口刚建立时尺寸未定，重新测一次
+            self.preview_canvas.update_idletasks()
+            cw = self.preview_canvas.winfo_width()
+            ch = self.preview_canvas.winfo_height()
+        cw, ch = max(1, cw), max(1, ch)
+        img_h, img_w = frame.shape[:2]
+        # 只在原图/画布尺寸变化时重算缩放尺寸，不每帧重复算
+        size_key = (img_w, img_h, cw, ch)
+        if size_key != self._preview_size:
+            scale = min(cw / img_w, ch / img_h)
+            self._preview_scaled = (max(1, int(img_w * scale)),
+                                    max(1, int(img_h * scale)))
+            self._preview_size = size_key
+        # 预览只用于人眼观察，BILINEAR 足够且比 LANCZOS 快很多
+        img = Image.fromarray(frame).resize(self._preview_scaled,
+                                           Image.BILINEAR)
         self._tk_img = ImageTk.PhotoImage(img)
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(cw // 2, ch // 2,
@@ -522,8 +631,28 @@ class OCRApp:
     # ==================================================================
     # 启停控制
     # ==================================================================
+    def _snapshot_params(self):
+        """在主线程把界面参数固化成 RunConfig，供工作线程只读使用。"""
+        return RunConfig(
+            prompt=self.prompt_text.get("1.0", tk.END).strip(),
+            ai_wait_ms=self._int_of(self.delay_ai_wait, DEFAULT_AI_WAIT_MS),
+            click_response_ms=self._int_of(self.delay_click_response,
+                                           DEFAULT_CLICK_RESPONSE_MS),
+            step_ms=self._int_of(self.delay_step, DEFAULT_STEP_MS),
+            scroll_settle_ms=self._int_of(self.delay_scroll_settle,
+                                          DEFAULT_SCROLL_SETTLE_MS),
+            question_limit=self._int_of(self.question_limit,
+                                        DEFAULT_QUESTION_LIMIT),
+            save_shots=bool(self.save_shots_var.get()),
+            auto_scroll=bool(self.auto_scroll_var.get()),
+        )
+
     def start_automation(self):
-        if self.is_running:
+        # 上一轮的线程可能仍在收尾：停止信号只让循环尽快退出，线程本身要
+        # 跑到 finally 才结束。此刻放新线程进来，两个循环会同时操作设备，
+        # 且新循环会重建停止信号，使旧线程的停止请求失效。
+        if self._worker is not None and self._worker.is_alive():
+            self.log("上一轮任务尚未完全退出，请稍候再启动。")
             return
         if not self.device_serial:
             self.log("请先连接 adb 设备。")
@@ -536,12 +665,20 @@ class OCRApp:
                      "或取消勾选。")
             return
 
+        # 参数快照必须在主线程采集（工作线程不得读取 Tk 控件）
+        self.cfg = self._snapshot_params()
         self.is_running = True
-        self.stop_event.clear()
+        self.stop_event = threading.Event()  # 每次运行独立的停止信号
         self.stats = {"answered": 0}
+        self._last_result_fp = None
+        self._answer_ctx = None     # 新一轮不复用上一轮的答案/已点击集合
+        self._last_answer = None
+        self._scroll_index = {}
+        self._scrolled_down = 0
+        self._last_state = None
         # 判分截图目录：以启动时间命名，本次运行的截图全部存入
         self._shot_dir = None
-        if self.save_shots_var.get():
+        if self.cfg.save_shots:
             self._shot_dir = os.path.join(SHOT_DIR,
                                           time.strftime("%Y%m%d_%H%M%S"))
             try:
@@ -550,14 +687,16 @@ class OCRApp:
             except OSError as e:
                 self._shot_dir = None
                 self.log(f"截图目录创建失败，已禁用截图：{e}")
-        threading.Thread(target=self._main_loop, daemon=True).start()
+        self._worker = threading.Thread(target=self._main_loop, daemon=True)
+        self._worker.start()
         self.log(">>> 自动化任务已启动。")
 
     def stop_task(self):
-        if self.is_running or not self.stop_event.is_set():
-            self.log("收到停止指令。")
+        # 只发停止信号，不复位 is_running：改由 _main_loop 的 finally 复位，
+        # 否则线程还在跑时界面就判为“已停止”，会放行第二次启动。
+        if self.is_running:
+            self.log("收到停止指令，正在安全退出…")
         self.stop_event.set()
-        self.is_running = False
 
     def _interruptible_sleep(self, seconds):
         """睡眠期间响应停止，返回 True 表示被要求停止。"""
@@ -578,7 +717,7 @@ class OCRApp:
                     if failures >= MAX_CONSECUTIVE_FAILURES:
                         self.log(f"连续 {failures} 轮失败，自动停止。")
                         break
-                limit = self._int_of(self.question_limit, DEFAULT_QUESTION_LIMIT)
+                limit = self.cfg.question_limit
                 if limit > 0 and self.stats["answered"] >= limit:
                     self.log(f"已完成 {self.stats['answered']} 题，达到上限，自动停止。")
                     break
@@ -608,7 +747,12 @@ class OCRApp:
             self.log("OCR 识别失败或无内容。")
             return False
 
-        state, target = self._detect_state(ocr_lines)
+        state, target = self._detect_state(ocr_lines, frame.shape[0])
+        if state != self._last_state:
+            self.log(f"页面状态：{state}（本页 OCR {len(ocr_lines)} 行）" +
+                     (f"，按钮中心 ({int(target[0])}, {int(target[1])})"
+                      if target else ""))
+            self._last_state = state
 
         if state == STATE_GROUP_END:
             self.log("检测到组结束页面，点击“再来一组”。")
@@ -616,13 +760,33 @@ class OCRApp:
 
         if state == STATE_RESULT:
             correct = self._extract_correct_answer(ocr_lines)
-            if correct:
-                self.log(f"本题正确答案：{correct}")
-            self.stats["answered"] += 1
-            if getattr(self, "_shot_dir", None):
-                self._save_result_shot(frame, ocr_lines)
+            fingerprint = self._result_fingerprint(ocr_lines, correct)
+            # 点完“下一题/完成”若页面没翻过去，下一轮仍是同一张判分页；
+            # 用指纹识别这种重复，避免同一题被计数两次（上限判断与
+            # 截图序号都依赖 answered）。
+            repeated = (fingerprint is not None
+                        and fingerprint == self._last_result_fp)
+            if fingerprint is not None:
+                self._last_result_fp = fingerprint
+            if repeated:
+                self.log("判分页与上一轮相同，判定为未翻页，重新点击按钮。")
+            else:
+                self.stats["answered"] += 1
+                if correct:
+                    self.log(f"本题正确答案：{correct}")
+                    if self._last_answer:
+                        mine = self._normalize_answer(self._last_answer)
+                        theirs = self._normalize_answer(correct)
+                        self.log(f"作答对比：我方 {mine} / 正确答案 {theirs}"
+                                 + ("，一致。" if mine == theirs
+                                    else "，不一致。"))
+                if self._shot_dir:
+                    self._save_result_shot(frame, ocr_lines)
+            # 按钮文案同样只看顶部区域，避免答案解析里的“完成”字样误判
+            top_y = frame.shape[0] * BUTTON_TOP_RATIO
             btn = "完成" if any(t.strip() == WORD_FINISH
-                            for _, t in ocr_lines) else "下一题"
+                             and self._box_center(b)[1] <= top_y
+                             for b, t in ocr_lines) else "下一题"
             return self._tap_pos(target, btn)
 
         if state == STATE_SUBMITTED:
@@ -630,7 +794,7 @@ class OCRApp:
             return self._tap_pos(target, "确定")
 
         if state == STATE_QUESTION:
-            return self._handle_question(ocr_lines)
+            return self._handle_question(frame, ocr_lines)
 
         self.log("当前页面无法识别，请确认手机处于答题 APP。")
         return False
@@ -645,8 +809,7 @@ class OCRApp:
             self.log(f"点击“{name}”失败：{e}")
             return False
         self.log(f"已点击“{name}” ({int(pos[0])}, {int(pos[1])})")
-        return not self._interruptible_sleep(
-            self._int_of(self.delay_click_response, DEFAULT_CLICK_RESPONSE_MS) / 1000.0)
+        return not self._interruptible_sleep(self.cfg.click_response_ms / 1000.0)
 
     # ------------------------------------------------------------------
     # OCR 与状态判定
@@ -691,17 +854,27 @@ class OCRApp:
             return None
         return [(line[0], line[1][0]) for line in result[0]]
 
-    def _detect_state(self, ocr_lines):
-        """按优先级判定页面状态，返回 (state, 目标按钮中心坐标或 None)。"""
+    def _detect_state(self, ocr_lines, frame_h):
+        """按优先级判定页面状态，返回 (state, 目标按钮中心坐标或 None)。
+
+        确定 / 下一题 / 完成 都固定在页面顶部四分之一内（实机截图确认），
+        加位置约束可避免题干或答案解析里出现同样的词时误判状态。
+        """
+        top_zone = frame_h * BUTTON_TOP_RATIO
+
+        def _in_top_zone(box):
+            return self._box_center(box)[1] <= top_zone
+
         for box, text in ocr_lines:
             if WORD_GROUP_END in text:
                 return STATE_GROUP_END, self._box_center(box)
         for box, text in ocr_lines:
             # 判分页：“下一题”或本组最后一题的“完成”
-            if WORD_NEXT in text or text.strip() == WORD_FINISH:
+            if (WORD_NEXT in text or text.strip() == WORD_FINISH) \
+                    and _in_top_zone(box):
                 return STATE_RESULT, self._box_center(box)
         for box, text in ocr_lines:
-            if text.strip() == WORD_SUBMIT:
+            if text.strip() == WORD_SUBMIT and _in_top_zone(box):
                 return STATE_SUBMITTED, self._box_center(box)
         # 选项前缀或"查看提示"均视为答题页（判断题可能漏检全部字母前缀）
         if any(OPTION_PREFIX_RE.match(text) or HINT_WORD in text
@@ -721,39 +894,121 @@ class OCRApp:
 
     @staticmethod
     def _extract_correct_answer(ocr_lines):
+        """从判分页取“正确答案：X”。
+
+        只取“答案”后面紧跟的字母串：整行可能还带解析文字（如“根据 B 条
+        款…”），直接 findall 会把解析里的字母也算进答案。
+        """
         for _, text in ocr_lines:
-            if WORD_CORRECT_ANSWER in text:
-                letters = re.findall(r"[A-H]", text)
-                if letters:
-                    return ",".join(letters)
+            if WORD_CORRECT_ANSWER not in text:
+                continue
+            m = AI_PAGE_ANSWER_WORD_RE.search(text.upper())
+            if not m:
+                continue
+            letters = re.sub(r"[,，、\s]", "", m.group(1))
+            if letters:
+                return ",".join(letters)
         return None
+
+    @staticmethod
+    def _normalize_answer(text):
+        """答案归一化：只保留 A-H 并去重排序，用于比较两个答案。"""
+        return "".join(sorted(set(re.sub(r"[^A-H]", "",
+                                        (text or "").upper()))))
+
+    @staticmethod
+    def _result_fingerprint(ocr_lines, correct):
+        """判分页指纹：正确答案 + 最长文本行（题干代表）。
+
+        用于识别“点完下一题但页面没翻过去”而重复出现的同一张判分页。
+        加载中遮罩会随加载完成消失，不参与指纹，避免同一题被判成两题。
+        页面文本过少时指纹不可靠，返回 None 表示本轮不参与去重。
+        """
+        texts = [t.strip() for _, t in ocr_lines
+                 if t.strip() and WORD_LOADING not in t]
+        main_line = max(texts, key=len) if texts else ""
+        if len(main_line) < 8:
+            return None
+        return f"{correct or ''}::{main_line}"
 
     # ------------------------------------------------------------------
     # 答题页处理
     # ------------------------------------------------------------------
-    def _handle_question(self, ocr_lines):
-        frame_w, frame_h = (self.device_resolution
-                            if self.device_resolution else (1440, 3200))
-        question_text, option_pos = parse_question_page(ocr_lines,
-                                                        frame_w, frame_h)
+    def _parse_page(self, frame, ocr_lines, frame_w, frame_h):
+        """解析答题页；选项字母不足/不连续时改用左侧竖带 OCR 补齐槽位。"""
+        question_text, options = parse_question_page(ocr_lines,
+                                                     frame_w, frame_h)
+        if len(options) >= 2 and self._letters_continuous(options):
+            return question_text, options
+        slots = self._detect_slots(frame, frame_w)
+        if not slots:
+            return question_text, options
+        self.log("左侧字母竖带检出槽位：" + ",".join(ch for ch, _ in slots))
+        q_new, opts_new = parse_question_page(ocr_lines, frame_w, frame_h,
+                                              slot_hint=slots)
+        better = (len(opts_new) > len(options)
+                  or (len(opts_new) == len(options)
+                      and not self._letters_continuous(options)
+                      and self._letters_continuous(opts_new)))
+        if better:
+            return q_new or question_text, opts_new
+        return question_text, options
+
+    @staticmethod
+    def _letters_continuous(options):
+        """选项字母是否从 A 起连续（缺字母说明有选项没识别出来）。"""
+        letters = sorted(options)
+        expect = [chr(ord("A") + i) for i in range(len(letters))]
+        return letters == expect
+
+    def _detect_slots(self, frame, frame_w):
+        """裁出左侧选项字母竖带单独 OCR，读出 A./B./C. 的字母列。
+
+        字母列横向固定（约占屏宽 20%）、纵向随题长延伸；单独识别比全屏
+        OCR 更稳，也能覆盖长题中被挤出屏幕的选项。只取字母与行位置，
+        选项文本仍来自全屏 OCR。
+        """
+        band_w = max(1, int(frame_w * OPTION_BAND_RATIO))
+        # 切片是视图（非连续内存），OCR 前复制一份
+        lines = self._ocr_frame(np.ascontiguousarray(frame[:, :band_w]))
+        return extract_slots_from_band(lines) if lines else []
+
+    @staticmethod
+    def _question_key(question_text, option_pos):
+        """同一题的识别指纹：归一化题干 + 选项字母集合。
+
+        只用于判断“是否还是上一轮那道题”，OCR 轻微抖动不应改变结论，
+        所以去掉空白与标点后截断。
+        """
+        norm = re.sub(r"[\s\W_]+", "", (question_text or "").upper())[:60]
+        return f"{norm}|{''.join(sorted(option_pos))}"
+
+    def _handle_question(self, frame, ocr_lines):
+        t_start = time.time()
+        frame_h, frame_w = frame.shape[:2]
+        question_text, option_pos = self._parse_page(frame, ocr_lines,
+                                                    frame_w, frame_h)
         if not question_text and not option_pos:
             self.log("未能解析出题干或选项，本轮跳过。")
             return False
 
-        # 长题模式：选项不足 2 个（题干过长把选项挤出屏幕）→ 滚动采集
-        long_mode = len(option_pos) < 2
+        # 长题模式：选项不足 2 个，或字母不从 A 起连续（缺项说明有选项
+        # 被挤出屏幕）→ 滚动采集
+        long_mode = (len(option_pos) < 2
+                     or not self._letters_continuous(option_pos))
         if long_mode:
-            self.log(f"仅检出 {len(option_pos)} 个选项，疑似题干过长，"
+            self.log(f"仅检出 {len(option_pos)} 个选项（"
+                     f"{','.join(sorted(option_pos)) or '无'}），疑似题干过长，"
                      "尝试滚动采集选项…")
             question_text, option_pos = self._collect_scrolled(
-                question_text, option_pos, frame_w, frame_h)
+                question_text, option_pos, frame_w, frame_h, ocr_lines)
             if not question_text or not option_pos:
                 self.log("滚动后仍无法采集到题目与选项，本轮跳过。")
                 return False
-            self.log("滚动采集完成，选项：" +
-                     str({k: v["text"][:20] for k, v in option_pos.items()}))
 
         self.log(f"识别题目：{question_text[:60]}...")
+        for letter, info in option_pos.items():
+            self.log(f"  选项 {letter}: {info['text'] or '（未识别到文本）'}")
         self.log("选项坐标：" + str(
             {k: (int(v["pos"][0]), int(v["pos"][1]))
              for k, v in option_pos.items()}))
@@ -763,38 +1018,58 @@ class OCRApp:
             f"{letter}. {info['text']}" for letter, info in option_pos.items())
         full_question = f"{question_text}\n{option_lines}"
 
-        # 1. 发给外部 AI
-        self._send_question_to_ai(full_question)
+        # 同一题重复进入（上一轮提交没成功）时复用已得到的答案与已点击
+        # 记录：既不必再等一次 AI，也避免对已选中的选项再点一次
+        # （多选题再点一次等于取消选中）。
+        ctx = self._answer_ctx
+        q_key = self._question_key(question_text, option_pos)
+        if ctx is None or ctx["key"] != q_key:
+            ctx = {"key": q_key, "answer": None, "clicked": set()}
+            self._answer_ctx = ctx
+        clicked = ctx["clicked"]
+        answer = ctx["answer"]
 
-        # 2. 等待 AI 作答
-        wait_ms = self._int_of(self.delay_ai_wait, DEFAULT_AI_WAIT_MS)
-        self.log(f"等待 AI 回答 {wait_ms}ms ...")
-        if self._interruptible_sleep(wait_ms / 1000.0):
-            return False
+        if answer:
+            self.log(f"同一题再次进入，复用上次答案：{answer}，"
+                     f"已点击：{','.join(sorted(clicked)) or '无'}")
+        else:
+            # 1. 发给外部 AI
+            self._send_question_to_ai(full_question)
 
-        # 2.5 部分 AI 回答后不会自动滚到页末：先滚轮向下翻到页底露出答案
-        if self.auto_scroll_var.get() and self.scroll_pos:
-            if self._scroll_ai_to_bottom():
+            # 2. 等待 AI 作答
+            wait_ms = self.cfg.ai_wait_ms
+            self.log(f"等待 AI 回答 {wait_ms}ms ...")
+            if self._interruptible_sleep(wait_ms / 1000.0):
                 return False
 
-        # 3. 读取 AI 回答（带轮询重试，应对答案生成慢的 AI）
-        answer = self._wait_ai_answer(set(option_pos))
-        if not answer:
-            self.log("未读取到有效答案，本轮跳过。")
-            return False
-        self.log(f"解析后答案：{answer}")
+            # 2.5 部分 AI 回答后不会自动滚到页末：先滚轮翻到页底露出答案
+            if self.cfg.auto_scroll and self.scroll_pos:
+                if self._scroll_ai_to_bottom():
+                    return False
+
+            # 3. 读取 AI 回答（带轮询重试，应对答案生成慢的 AI）
+            answer = self._wait_ai_answer(set(option_pos))
+            if not answer:
+                self.log("未读取到有效答案，本轮跳过。")
+                return False
+            self.log(f"解析后答案：{answer}")
+            ctx["answer"] = answer
+        self._last_answer = answer
 
         # 4. 逐个点击选项
-        interval = self._int_of(self.delay_click_response,
-                                DEFAULT_CLICK_RESPONSE_MS) / 1000.0
+        interval = self.cfg.click_response_ms / 1000.0
         if long_mode:
             # 长题模式：选项可能不在当前屏幕，需滚动搜索定位
-            if not self._click_answers_scrolled(answer, frame_w, frame_h):
+            if not self._click_answers_scrolled(answer, frame_w, frame_h,
+                                                clicked):
                 return False
         else:
             for ch in answer:
                 if self.stop_event.is_set():
                     return False
+                if ch in clicked:
+                    self.log(f"选项 {ch} 已点击过，跳过重复点击。")
+                    continue
                 if ch not in option_pos:
                     self.log(f"答案字母 {ch} 未找到对应选项，跳过。")
                     continue
@@ -803,19 +1078,25 @@ class OCRApp:
                 except AdbError as e:
                     self.log(f"点击选项 {ch} 失败：{e}")
                     return False
+                clicked.add(ch)
                 self.log(f"已点击选项 {ch}")
-                if self._interruptible_sleep(
-                        self._int_of(self.delay_step, DEFAULT_STEP_MS) / 1000.0):
+                if self._interruptible_sleep(self.cfg.step_ms / 1000.0):
                     return False
 
         # 5. 提交：等页面出现"确定"后点击
-        return self._wait_and_submit(interval)
+        ok = self._wait_and_submit(interval)
+        if ok:
+            # 本题已进入判分页：清空缓存，避免“再来一组”重做同一道题时
+            # 因复用已点击集合而什么都不点就直接提交
+            self._answer_ctx = None
+        self.log(f"本题处理完毕，耗时 {time.time() - t_start:.1f}s")
+        return ok
 
     # ------------------------------------------------------------------
     # 长题：滚动采集与搜索点击
     # ------------------------------------------------------------------
     def _screenshot_ocr(self):
-        """加锁截图 + OCR，返回 [(box, text), ...]；失败返回 None。"""
+        """加锁截图 + OCR，返回 (frame, [(box, text), ...])；失败为 (None, None)。"""
         if self.adb_lock.acquire(timeout=ADB_TIMEOUT):
             try:
                 frame = self.adb.screencap()
@@ -825,10 +1106,10 @@ class OCRApp:
             finally:
                 self.adb_lock.release()
         else:
-            return None
+            return None, None
         if frame is None:
-            return None
-        return self._ocr_frame(frame)
+            return None, None
+        return frame, self._ocr_frame(frame)
 
     def _scroll_page(self, frame_w, frame_h, reverse=False):
         """滑动答题页。默认上滑使页面下滚（露出下方内容），reverse 反向。"""
@@ -844,71 +1125,107 @@ class OCRApp:
                 self.adb_lock.release()
         self._interruptible_sleep(SCROLL_SETTLE_S)
 
-    def _collect_scrolled(self, question_text, option_pos, frame_w, frame_h):
+    def _collect_scrolled(self, question_text, option_pos, frame_w, frame_h,
+                          prev_lines):
         """长题滚动采集：逐屏下滚，合并选项与题干尾部。
 
         页面从顶部加载，首帧题干完整；滚动只为补齐被挤出屏幕的选项，
-        顺带把极端情况下滚出屏幕底部的题干尾部拼接进来。
+        顺带把极端情况下滚出屏幕底部的题干尾部拼接进来。同时记录
+        “字母 -> 第几屏”，供点击时直接滚到目标位置（不必从句首往下爬）。
         """
         self._scrolled_down = 0
+        self._scroll_index = {ch: 0 for ch in option_pos}
+        prev_texts = {t for _, t in prev_lines}
         for _ in range(MAX_LONG_Q_SCROLLS):
             if self.stop_event.is_set():
                 break
             self._scroll_page(frame_w, frame_h)
             self._scrolled_down += 1
-            lines = self._screenshot_ocr()
+            frame, lines = self._screenshot_ocr()
             if not lines:
                 continue
-            q_new, opts_new = parse_question_page(lines, frame_w, frame_h)
+            q_new, opts_new = self._parse_page(frame, lines, frame_w, frame_h)
             added = 0
             for letter, info in opts_new.items():
                 old = option_pos.get(letter)
                 if info["text"] and (old is None or not old["text"]):
                     option_pos[letter] = info
                     added += 1
+                if letter not in self._scroll_index and info["text"]:
+                    self._scroll_index[letter] = self._scrolled_down
             # 题干尾部拼接（去整句重复；局部重叠允许少量冗余）
             if q_new and q_new not in question_text \
                     and question_text not in q_new:
                 question_text = (question_text + " " + q_new).strip()
-            if not added:
-                break  # 本屏无新选项，视为已滚到底
+            # 到底检测：既没新选项、也没新文本 = 页面未再滚动
+            cur_texts = {t for _, t in lines}
+            new_texts = cur_texts - prev_texts
+            if not added and not new_texts:
+                self.log("滚动后页面无新增内容，判定已到页末，停止采集。")
+                break
+            prev_texts |= cur_texts
+        self.log(f"滚动采集完成，共下滚 {self._scrolled_down} 屏，选项："
+                 + ",".join(sorted(option_pos)))
         return question_text, option_pos
 
     def _find_option_on_screen(self, letter, frame_w, frame_h):
         """当前屏 OCR 找到指定字母的选项前缀框，返回点击坐标；否则 None。"""
-        lines = self._screenshot_ocr()
+        _, lines = self._screenshot_ocr()
         if not lines:
             return None
-        pat = re.compile(rf'^\s*{letter}\s*[.。:：]')
-        band = frame_w * 0.19
-        cands = [box for box, text in lines if pat.match(text)]
+        # 行首字母后可能跟 . : 、 ) 或直接结束（OCR 丢了分隔符）
+        pat = re.compile(rf'^\s*{letter}\s*(?:[.。．:：、)）]|$)')
+        band = frame_w * OPTION_BAND_RATIO
+        cands = [box for box, text in lines if pat.match(text.strip())]
         if not cands:
             return None
-        # 优先竖带内的前缀框（选项字母列），否则取第一个命中
-        for box in cands:
-            if min(p[0] for p in box) <= band:
-                return frame_w / 2, self._box_center(box)[1]
-        return frame_w / 2, self._box_center(cands[0])[1]
+        # 优先竖带内的前缀框（选项字母列）；同在竖带内取最靠上的一个，
+        # 避免选项正文恰好以该字母开头时被误命中
+        in_band = [box for box in cands
+                   if min(p[0] for p in box) <= band]
+        box = min(in_band or cands, key=lambda b: self._box_center(b)[1])
+        return frame_w / 2, self._box_center(box)[1]
 
-    def _click_answers_scrolled(self, answer, frame_w, frame_h):
-        """长题模式：滚动搜索每个答案字母并点击；找不到则弃题点 A。"""
-        rel = getattr(self, "_scrolled_down", 0)  # 相对页面顶部的下滚屏数
-        step_s = self._int_of(self.delay_step, DEFAULT_STEP_MS) / 1000.0
-        for ch in answer:
+    def _scroll_to_screen(self, letter, target, rel, frame_w, frame_h):
+        """滚到第 target 屏并定位字母，返回 (点击坐标或 None, 当前屏号)。
+
+        定位失败时在相邻屏各试一次，覆盖“选项刚好跨屏”造成的偏差。
+        """
+        while rel != target and not self.stop_event.is_set():
+            reverse = target < rel
+            self._scroll_page(frame_w, frame_h, reverse=reverse)
+            rel += -1 if reverse else 1
+        pos = self._find_option_on_screen(letter, frame_w, frame_h)
+        if pos is None and rel > 0:
+            self._scroll_page(frame_w, frame_h, reverse=True)
+            rel -= 1
+            pos = self._find_option_on_screen(letter, frame_w, frame_h)
+        if pos is None and rel < MAX_LONG_Q_SCROLLS:
+            self._scroll_page(frame_w, frame_h)
+            rel += 1
+            pos = self._find_option_on_screen(letter, frame_w, frame_h)
+        return pos, rel
+
+    def _click_answers_scrolled(self, answer, frame_w, frame_h, clicked):
+        """长题模式：按字母所在屏号滚到目标位置再点击；找不到则弃题点 A。"""
+        rel = self._scrolled_down      # 相对页面顶部的下滚屏数
+        index = self._scroll_index
+        step_s = self.cfg.step_ms / 1000.0
+        # 先点离当前屏最近的字母，减少来回滚动
+        ordered = sorted(answer,
+                         key=lambda ch: (abs(index.get(ch, rel) - rel), ch))
+        for ch in ordered:
             if self.stop_event.is_set():
                 return False
-            pos = self._find_option_on_screen(ch, frame_w, frame_h)
-            while pos is None and rel > 0:
-                self._scroll_page(frame_w, frame_h, reverse=True)
-                rel -= 1
-                pos = self._find_option_on_screen(ch, frame_w, frame_h)
-            while pos is None and rel < MAX_LONG_Q_SCROLLS:
-                self._scroll_page(frame_w, frame_h)
-                rel += 1
-                pos = self._find_option_on_screen(ch, frame_w, frame_h)
+            if ch in clicked:
+                self.log(f"选项 {ch} 已点击过，跳过重复点击。")
+                continue
+            pos, rel = self._scroll_to_screen(ch, index.get(ch, rel), rel,
+                                              frame_w, frame_h)
             if pos is None:
                 self.log(f"滚动后仍未找到选项 {ch}，放弃本题，改点 A 提交。")
-                pos = self._find_option_on_screen("A", frame_w, frame_h)
+                pos, rel = self._scroll_to_screen("A", 0, rel,
+                                                  frame_w, frame_h)
                 if pos is None:
                     return False
             try:
@@ -916,6 +1233,7 @@ class OCRApp:
             except AdbError as e:
                 self.log(f"点击选项 {ch} 失败：{e}")
                 return False
+            clicked.add(ch)
             self.log(f"已点击选项 {ch} ({int(pos[0])}, {int(pos[1])})")
             if self._interruptible_sleep(step_s):
                 return False
@@ -937,7 +1255,7 @@ class OCRApp:
                 if frame is not None:
                     lines = self._ocr_frame(frame)
                     if lines:
-                        state, pos = self._detect_state(lines)
+                        state, pos = self._detect_state(lines, frame.shape[0])
                         if state == STATE_SUBMITTED and pos:
                             return self._tap_pos(pos, "确定")
                         if state == STATE_RESULT:
@@ -951,7 +1269,7 @@ class OCRApp:
     # 外部 AI 窗口交互（PC 侧，沿用剪贴板 + pyautogui）
     # ------------------------------------------------------------------
     def _send_question_to_ai(self, question_text):
-        prompt = self.prompt_text.get("1.0", tk.END).strip()
+        prompt = self.cfg.prompt
         pyperclip.copy(f"{prompt}\n{question_text}")
         pyautogui.click(*self.ai_input_pos)
         time.sleep(0.3)
@@ -975,8 +1293,7 @@ class OCRApp:
             if self._interruptible_sleep(0.05):
                 return True
         # 全部滚动结束后等待页面稳定，再进行 OCR 识别
-        settle_ms = self._int_of(self.delay_scroll_settle,
-                                 DEFAULT_SCROLL_SETTLE_MS)
+        settle_ms = self.cfg.scroll_settle_ms
         self.log(f"已滚动 AI 对话区到页末，等待 {settle_ms}ms 后识别答案 ...")
         return self._interruptible_sleep(settle_ms / 1000.0)
 
@@ -1007,7 +1324,7 @@ class OCRApp:
         lines = [(self._box_center(line[0])[1], line[1][0])
                  for line in result[0]]           # [(行中心 y, 文本), ...]
 
-        prompt_head = self.prompt_text.get("1.0", tk.END).strip()[:8]
+        prompt_head = self.cfg.prompt[:8]
         marker_y = None
         if prompt_head:
             hit = [cy for cy, t in lines if prompt_head in t.replace(" ", "")]
@@ -1088,7 +1405,7 @@ class OCRApp:
             self.log(f"答案尚未出现在页面上，{AI_ANSWER_POLL_S} 秒后重试识别…")
             if self._interruptible_sleep(AI_ANSWER_POLL_S):
                 return None
-            if self.auto_scroll_var.get() and self.scroll_pos:
+            if self.cfg.auto_scroll and self.scroll_pos:
                 self._scroll_ai_to_bottom()
         self.log(f"重试 {retries} 次仍未读到答案，转储页面文本辅助排查。")
         return self._read_ai_answer(valid_letters, dump=True)
@@ -1119,6 +1436,7 @@ class OCRApp:
             self.stop_task()
 
     def on_close(self):
+        self._flush_params()   # 关窗前把未落盘的参数写完
         self.stop_event.set()
         self._preview_stop.set()
         if self._preview_thread and self._preview_thread.is_alive():

@@ -14,6 +14,7 @@ venv/
 # 运行时生成
 params.json
 screenshots/
+logs/
 paddle_models/
 
 # 打包产物
@@ -23,7 +24,7 @@ dist/
 app.ico
 build_log.txt
 
-# adb/ 目录内置 adb + scrcpy-win64-v3.3.4 驱动，随仓库发布，不做忽略
+# adb/ 目录内置 adb 1.0.41 + scrcpy-win64-v5.0.1 驱动，随仓库发布，不做忽略
 
 # 调试素材
 screenPNG/

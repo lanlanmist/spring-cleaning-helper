@@ -24,10 +24,11 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- 全局常量 ---
-APP_VERSION = "大扫除小助手 V3.0"
+APP_VERSION = "大扫除小助手 V3.2"
 PARAMS_FILE = os.path.join(BASE_DIR, "params.json")
 ADB_DIR = os.path.join(BASE_DIR, "adb")
 SHOT_DIR = os.path.join(BASE_DIR, "screenshots")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
 # 内置 OCR 模型目录（随 exe 发布，避免目标机器联网下载）；不存在则走默认缓存
 MODEL_DIR = os.path.join(BASE_DIR, "paddle_models")
 
@@ -38,6 +39,9 @@ WORD_FINISH = "完成"          # 本组最后一题判分页（替代“下一�
 WORD_SUBMIT = "确定"          # 已选择选项后的提交按钮
 WORD_CORRECT_ANSWER = "正确答案"  # 判分页答案解析中的正确答案
 WORD_LOADING = "加载中"        # 判分页刚出现时残留的加载提示（截图需等它消失）
+# 提交/判分页的按钮（确定 / 下一题 / 完成）固定在页面顶部四分之一内；
+# 用位置约束避免题干或答案解析里出现同样的词时误判状态
+BUTTON_TOP_RATIO = 0.25
 
 # 默认参数（毫秒）
 DEFAULT_PROMPT = "请给出这道题的答案。只给出选项，不用给出解析。不需要给出任何分析过程，只给出答案选项。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开：\n"
@@ -49,6 +53,7 @@ DEFAULT_QUESTION_LIMIT = 20    # 启动后答题数量上限
 # 预览设置
 PREVIEW_WIDTH = 360            # 预览画布显示宽度（像素）
 PREVIEW_INTERVAL = 1.0         # 预览刷新间隔（秒）
+PREVIEW_INTERVAL_RUNNING = 3.0  # 自动化运行中的预览间隔，减少与截图互斥竞争
 ADB_TIMEOUT = 15               # adb 命令超时（秒）
 MAX_CONSECUTIVE_FAILURES = 5   # 连续识别/截图失败多少次后自动停止
 MAX_PREVIEW_FAILURES = 10      # 预览连续截图失败多少次后判定设备断开
