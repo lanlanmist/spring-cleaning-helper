@@ -1,4 +1,4 @@
-"""大扫除小助手 V3.2 主窗口。
+"""大扫除小助手 V3.3 主窗口。
 
 手机端操作全部走 adb（截图 + tap），元素位置运行时 OCR 自动定位，不落盘；
 外部 AI 窗口（AI 页面区/输入框/发送键）仅运行期标定，关闭即清除；
@@ -38,10 +38,12 @@ from config import (
     PARAMS_FILE, PREVIEW_INTERVAL, PREVIEW_INTERVAL_RUNNING, PREVIEW_WIDTH,
     SCROLL_SETTLE_S, SHOT_DIR,
     WORD_CORRECT_ANSWER, WORD_FINISH, WORD_LOADING,
-    WORD_GROUP_END, WORD_NEXT, WORD_SUBMIT, ocr,
+    WORD_GROUP_END, WORD_NEXT, WORD_SUBMIT,
 )
 from gui_selectors import PointSelector, RegionSelector
 from image_clean import remove_watermark
+from ocr_engine import (get_ocr, is_ocr_ready, ocr_error, wait_ocr_ready,
+                        warm_up_ocr)
 from quiz_parser import (HINT_WORD, OPTION_BAND_RATIO, OPTION_PREFIX_RE,
                          QUESTION_MARKER, TYPE_WORDS, extract_slots_from_band,
                          parse_question_page)
@@ -144,6 +146,7 @@ class OCRApp:
         self._scrolled_down = 0      # 长题：当前已下滚的屏数
         self._last_state = None      # 上一次页面状态，仅在变化时打日志
         self._save_job = None        # 参数延迟写入的 after 句柄（去抖用）
+        self._ocr_warm_thread = None  # OCR 模型预热线程（后台加载，不阻塞窗口）
 
         # --- 预览线程 ---
         self._preview_stop = threading.Event()
@@ -156,10 +159,53 @@ class OCRApp:
         self._load_params()
         self._setup_esc_listener()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._start_ocr_warmup()
 
         if not self.adb.adb_path:
             self.log("未找到 adb，请把 scrcpy 目录中的 adb.exe 及两个 dll "
                      "复制到项目 adb/ 目录（或加入系统 PATH）。")
+
+    # ==================================================================
+    # OCR 引擎预热（窗口先出现，模型在后台加载）
+    # ==================================================================
+    def _start_ocr_warmup(self):
+        """后台预热 OCR 模型。
+
+        懒加载后模型不再拖住程序启动，但如果不预热，这 20~30 秒会挤到
+        第一题里（用户看到的是“点了启动没反应”），所以启动即预热。
+        """
+        if self._ocr_warm_thread and self._ocr_warm_thread.is_alive():
+            return
+        self._ocr_warm_thread = threading.Thread(
+            target=self._warm_up_ocr_worker, daemon=True, name="ocr-warmup")
+        self._ocr_warm_thread.start()
+
+    def _warm_up_ocr_worker(self):
+        self.log("OCR 引擎预热开始（首次加载模型，可能需要数十秒，"
+                 "期间窗口可正常操作）…")
+        ok, seconds, err = warm_up_ocr()
+        if ok:
+            self.log(f"OCR 引擎预热完成，耗时 {seconds:.1f}s。")
+        else:
+            self.log(f"OCR 引擎预热失败（{seconds:.1f}s）：{err}")
+
+    def _wait_ocr_ready(self):
+        """等预热结束；返回 False 表示不可用或被要求停止。"""
+        if is_ocr_ready():
+            return True
+        if ocr_error() is not None:
+            self.log(f"OCR 引擎不可用，无法开始识别：{ocr_error()}")
+            return False
+        self.log("OCR 引擎尚未预热完成，任务将在预热结束后自动开始…")
+        while not self.stop_event.is_set():
+            wait_ocr_ready(0.2)
+            if is_ocr_ready():
+                self.log("OCR 引擎已就绪，开始识别。")
+                return True
+            if ocr_error() is not None:
+                self.log(f"OCR 引擎预热失败，无法继续：{ocr_error()}")
+                return False
+        return False
 
     # ==================================================================
     # UI
@@ -329,7 +375,8 @@ class OCRApp:
         else:
             try:
                 self.root.after(0, self._append_log, message)
-            except tk.TclError:
+            except (tk.TclError, RuntimeError):
+                # 窗口已销毁，或主循环未运行（如无 GUI 的脚本直接构造窗口）
                 pass
         print(message)
 
@@ -665,6 +712,9 @@ class OCRApp:
                      "或取消勾选。")
             return
 
+        if not is_ocr_ready():
+            self.log("OCR 引擎仍在后台预热，任务会等预热完成后自动开始识别。")
+
         # 参数快照必须在主线程采集（工作线程不得读取 Tk 控件）
         self.cfg = self._snapshot_params()
         self.is_running = True
@@ -708,6 +758,9 @@ class OCRApp:
     def _main_loop(self):
         failures = 0
         try:
+            # 预热未完成时先等（UI 不冻结，Esc 仍可停止）
+            if not self._wait_ocr_ready():
+                return
             while not self.stop_event.is_set():
                 ok = self._one_round()
                 if ok:
@@ -849,7 +902,7 @@ class OCRApp:
 
     def _ocr_frame(self, frame):
         """全屏 OCR（先抹除粉色水印），返回 [(box, text), ...]；失败返回 None。"""
-        result = ocr.ocr(remove_watermark(frame), cls=False)
+        result = get_ocr().ocr(remove_watermark(frame), cls=False)
         if not result or not result[0]:
             return None
         return [(line[0], line[1][0]) for line in result[0]]
@@ -1318,7 +1371,7 @@ class OCRApp:
         with mss.mss() as sct:
             shot = np.array(sct.grab({"left": x1, "top": y1,
                                       "width": x2 - x1, "height": y2 - y1}))[:, :, :3]
-        result = ocr.ocr(shot, cls=False)
+        result = get_ocr().ocr(shot, cls=False)
         if not result or not result[0]:
             return None
         lines = [(self._box_center(line[0])[1], line[1][0])
