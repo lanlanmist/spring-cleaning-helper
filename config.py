@@ -9,13 +9,13 @@ except (AttributeError, OSError):
     pass
 
 # --- 屏蔽 Paddle 杂讯（必须在 import paddleocr 之前设置才生效） ---
+# paddleocr 的导入与模型加载已移到 ocr_engine.get_ocr()（懒加载），
+# 但环境变量仍需在这里、早于任何 paddleocr 导入就设好
 os.environ.update({
     "FLAGS_use_onednn": "0",
     "FLAGS_enable_pir_api": "0",
     "PADDLE_DISABLE_PIR": "1",
 })
-
-from paddleocr import PaddleOCR  # noqa: E402
 
 # --- 基础目录：PyInstaller 冻结后锚定 exe 所在目录，源码运行时为项目目录 ---
 if getattr(sys, "frozen", False):
@@ -24,7 +24,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- 全局常量 ---
-APP_VERSION = "大扫除小助手 V3.2"
+APP_VERSION = "大扫除小助手 V3.3"
 PARAMS_FILE = os.path.join(BASE_DIR, "params.json")
 ADB_DIR = os.path.join(BASE_DIR, "adb")
 SHOT_DIR = os.path.join(BASE_DIR, "screenshots")
@@ -69,24 +69,5 @@ DEFAULT_SCROLL_SETTLE_MS = 1000  # 全部滚动结束后、OCR 识别前的等�
 AI_ANSWER_RETRY_S = 15         # 固定等待期满后，最多再轮询等待的秒数
 AI_ANSWER_POLL_S = 1.5         # 两次轮询识别的间隔秒数
 
-print("正在热机 PaddleOCR...")
-_model_kwargs = {}
-if os.path.isdir(MODEL_DIR):
-    # 使用随程序发布的本地模型（det/rec/cls 下各有一个 *_infer 目录），
-    # 离线也可运行；目录不全则整体回退默认缓存路径
-    _sub = {"det": None, "rec": None, "cls": None}
-    for key in _sub:
-        _d = os.path.join(MODEL_DIR, key)
-        if os.path.isdir(_d):
-            _infer = next((os.path.join(_d, n) for n in os.listdir(_d)
-                           if n.endswith("_infer")), None)
-            _sub[key] = _infer
-    if all(_sub.values()):
-        _model_kwargs = {
-            "det_model_dir": _sub["det"],
-            "rec_model_dir": _sub["rec"],
-            "cls_model_dir": _sub["cls"],
-        }
-ocr = PaddleOCR(lang="ch", use_angle_cls=False, show_log=False,
-                **_model_kwargs)
-print("OCR 就绪\n")
+# OCR 引擎：见 ocr_engine.py（懒加载单例 + 后台预热）。
+# 这里只保留模型目录路径，import 本模块不再触发 20~30 秒的模型加载。

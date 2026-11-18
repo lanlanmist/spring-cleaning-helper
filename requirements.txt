@@ -1,4 +1,5 @@
 # 直接依赖（本项目代码实际 import 的包），版本为开发验证环境
+# V3.3：OCR 引擎改为懒加载 + 后台预热（新增 ocr_engine.py），未新增或升级任何第三方包
 # V3.2：新增能力（文件日志 / 参数原子写 / 线程参数快照）只用到标准库
 #       logging、dataclasses、threading，未新增或升级任何第三方包
 paddleocr==2.6.1.2
