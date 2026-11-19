@@ -14,10 +14,11 @@
 
 import re
 
-# 选项字母竖带：选项字母列横向固定在屏幕左侧（约占宽度 20%），纵向随
-# 题目/选项长度延伸。单独裁出这一条竖带做 OCR，得到的 A/B/C… 序列比
-# 全屏识别更稳（长题时尤为明显）。
-OPTION_BAND_RATIO = 0.20
+from layout_profile import DEFAULT_LAYOUT
+
+# 选项字母竖带（宽度见 DEFAULT_LAYOUT.option_band_ratio）：选项字母列横向
+# 固定在屏幕左侧（约占宽度 20%），纵向随题目/选项长度延伸。单独裁出这一
+# 条竖带做 OCR，得到的 A/B/C… 序列比全屏识别更稳（长题时尤为明显）。
 # 竖带内只取“纯字母”框（"A" / "A." / "A:"），选项正文另行归属
 # 分隔符兼容半角 . :、全角。．：：五种写法（OCR 常混用）
 SLOT_LETTER_RE = re.compile(r'^\s*([A-H])\s*[.。．:：]?\s*$')
@@ -168,7 +169,8 @@ def _sequential_options(zone, frame_w):
 def extract_slots_from_band(band_lines):
     """从左侧字母竖带的 OCR 结果提取选项槽位。
 
-    band_lines 是“只裁了左侧 OPTION_BAND_RATIO 宽度”的图像的识别结果，
+    band_lines 是“只裁了左侧 DEFAULT_LAYOUT.option_band_ratio 宽度”的
+    图像的识别结果，
     裁剪只发生在横向，因此 y 坐标与原图一致，可直接用作点击行。
     返回 [(字母, 行中心 y), ...]，按 y 升序；同一字母重复出现时取最靠上
     的一个（竖带内真正的槽位总是在该字母所在行的顶部）。
@@ -185,7 +187,8 @@ def extract_slots_from_band(band_lines):
     return sorted(found.items(), key=lambda kv: kv[1])
 
 
-def _options_from_slots(slot_hint, content_rows, band_extra, frame_w, frame_h):
+def _options_from_slots(slot_hint, content_rows, band_extra, frame_w, frame_h,
+                        layout=DEFAULT_LAYOUT):
     """按竖带槽位组装选项：槽位给字母与点击 y，文本就近归属。
 
     竖带宽度内的行多数是字母/水印残留，只有宽度足够大的行（选项正文因
@@ -195,15 +198,16 @@ def _options_from_slots(slot_hint, content_rows, band_extra, frame_w, frame_h):
     """
     ys = [y for _, y in slot_hint]
     gaps = [b - a for a, b in zip(ys, ys[1:])]
-    row_gap = sorted(gaps)[len(gaps) // 2] if gaps else frame_h * 0.09
+    row_gap = (sorted(gaps)[len(gaps) // 2] if gaps
+               else frame_h * layout.default_row_gap_ratio)
     options = {letter: {"text": "", "pos": (frame_w / 2, y)}
                for letter, y in slot_hint}
     extra_rows = [r for r in band_extra
                   if r.get("_force")
-                  or (r["x1"] - r["x0"]) > frame_w * 0.3]
+                  or (r["x1"] - r["x0"]) > frame_w * layout.band_wide_ratio]
     for r in content_rows + extra_rows:
         nearest = min(slot_hint, key=lambda slot: abs(slot[1] - r["y"]))
-        if abs(nearest[1] - r["y"]) <= row_gap * 0.6:
+        if abs(nearest[1] - r["y"]) <= row_gap * layout.row_gap_match_ratio:
             info = options[nearest[0]]
             info["text"] = (info["text"] + " " + r["text"]).strip()
     for info in options.values():
@@ -211,12 +215,14 @@ def _options_from_slots(slot_hint, content_rows, band_extra, frame_w, frame_h):
     return options
 
 
-def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
+def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None,
+                        layout=DEFAULT_LAYOUT):
     """解析答题页。
 
     slot_hint: 左侧字母竖带直读出的槽位 [(字母, y), ...]。提供时跳过
     “前缀行拟合 + 缺失回填”，直接按槽位归属选项文本——长题或全屏
     OCR 漏识字母时由调用方补上，比拟合推断更可靠。
+    layout: 布局比例（见 layout_profile），默认全局 DEFAULT_LAYOUT。
 
     返回 (question_text, options)：
       question_text: 题干文本（含题型标签），失败为 None；
@@ -224,8 +230,8 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
     """
     clean = [(box, t) for box, t in ocr_lines if not is_noise(t)]
     # 选项前缀竖带：屏幕左侧一段固定宽度（选项字母排在题型标签正下方）
-    band_right = frame_w * OPTION_BAND_RATIO
-    rows = group_rows(clean, frame_h * 0.02, band_right)
+    band_right = frame_w * layout.option_band_ratio
+    rows = group_rows(clean, frame_h * layout.row_tol_ratio, band_right)
     if not rows:
         return None, {}
 
@@ -236,7 +242,9 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
     if q_idx is None:
         # 无"题目"标记时，取第一个足够长的行作题干起点
         q_idx = next((i for i, r in enumerate(rows)
-                      if len(r["text"]) >= 8 and r["y"] > frame_h * 0.1), None)
+                      if len(r["text"]) >= 8
+                      and r["y"] > frame_h * layout.question_zone_start_ratio),
+                     None)
     if q_idx is None:
         return None, {}
     for r in rows[:q_idx]:
@@ -255,7 +263,7 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
         # 与首个前缀行同一视觉行的内容框（如判断题的"正确"）在 rows 里
         # 可能因 y 坐标抖动排在前缀行之前——按 y 边界一并划入选项区，
         # 否则会误并入题干导致选项 A 为空
-        y_bound = rows[opt_start]["y"] - frame_h * 0.012
+        y_bound = rows[opt_start]["y"] - frame_h * layout.merge_tol_ratio
         q_area_end = next((i for i in range(q_idx + 1, opt_start + 1)
                            if rows[i]["y"] >= y_bound), opt_start)
     else:
@@ -265,9 +273,12 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
         while i < hint_idx:
             nxt = rows[i]
             gap = nxt["y"] - rows[q_end]["y"]
-            if gap >= frame_h * 0.06 or HINT_WORD in nxt["text"]:
+            if gap >= frame_h * layout.question_extend_gap_ratio \
+                    or HINT_WORD in nxt["text"]:
                 break
-            if nxt.get("_band") and (nxt["x1"] - nxt["x0"]) < frame_w * 0.2:
+            narrow_band = ((nxt["x1"] - nxt["x0"])
+                           < frame_w * layout.band_narrow_ratio)
+            if nxt.get("_band") and narrow_band:
                 i += 1
                 continue  # 竖带内窄框（残留噪声）：跳过不并入题干
             q_end = i
@@ -277,7 +288,7 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
     # 题目区文本：视觉行重排（代码块多列框按 x 排序）后逐行清洗
     question_lines = []
     for text in _merge_visual_lines(rows[q_idx:q_area_end],
-                                    frame_h * 0.012):
+                                    frame_h * layout.merge_tol_ratio):
         t = _clean_qline(text)
         if t:
             question_lines.append(t)
@@ -289,11 +300,13 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
     if hint_idx < len(rows):
         zone = rows[q_area_end:hint_idx]
     else:
-        zone = [r for r in rows[q_area_end:] if r["y"] < frame_h * 0.75]
+        zone = [r for r in rows[q_area_end:]
+                if r["y"] < frame_h * layout.option_zone_end_ratio]
     if not zone:
         if slot_hint:
             return question_text, _options_from_slots(slot_hint, [], [],
-                                                      frame_w, frame_h)
+                                                      frame_w, frame_h,
+                                                      layout)
         return question_text, {}
 
     # --- 按几何列分类：选项前缀竖带 vs 内容列 ---
@@ -325,7 +338,8 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
             if p["rest"]:
                 extra.append(dict(p["row"], text=p["rest"], _force=True))
         return question_text, _options_from_slots(slot_hint, content_rows,
-                                                  extra, frame_w, frame_h)
+                                                  extra, frame_w, frame_h,
+                                                  layout)
 
     if not prefix_rows:
         # 完全无前缀（如纯判断题）：按顺序兜底分配
@@ -341,16 +355,17 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
         my = sum(y for _, y in ys_pairs) / n
         den = sum((x - mx) ** 2 for x, _ in ys_pairs)
         row_gap = (sum((x - mx) * (y - my) for x, y in ys_pairs) / den
-                   if den else frame_h * 0.09)
+                   if den else frame_h * layout.default_row_gap_ratio)
     else:
         ysv = [y for _, y in ys_pairs]
         gaps = [b - a for a, b in zip(ysv, ysv[1:])]
         if gaps:
             median = sorted(gaps)[len(gaps) // 2]
-            keep = [g for g in gaps if g >= median * 0.6] or gaps
+            keep = [g for g in gaps
+                    if g >= median * layout.gap_median_keep_ratio] or gaps
             row_gap = sum(keep) / len(keep)
         else:
-            row_gap = frame_h * 0.09
+            row_gap = frame_h * layout.default_row_gap_ratio
 
     # --- 线性拟合出字母 A 的行位置，槽位数以最大前缀字母为准 ---
     origins = [p["row"]["y"] - (ord(p["letter"]) - ord("A")) * row_gap
@@ -374,14 +389,16 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
         ey = y_origin + k * row_gap
         if not (0 <= ey <= frame_h):
             continue
-        cands = [r for r in pool if abs(r["y"] - ey) <= row_gap * 0.5]
+        cands = [r for r in pool
+                 if abs(r["y"] - ey) <= row_gap * layout.slot_search_ratio]
         if cands:
             # 宽内容行优先（窄框多为水印残留），同级再按距离
-            cands.sort(key=lambda r: (0 if (r["x1"] - r["x0"]) > frame_w * 0.3
+            cands.sort(key=lambda r: (0 if (r["x1"] - r["x0"])
+                                      > frame_w * layout.band_wide_ratio
                                       else 1, abs(r["y"] - ey)))
             r = cands[0]
             # 窄框（水印）仅借用其 y 定位，文本不带入
-            wide = (r["x1"] - r["x0"]) > frame_w * 0.3
+            wide = (r["x1"] - r["x0"]) > frame_w * layout.band_wide_ratio
             letter_rows.append([letter, r["y"], r["text"] if wide else ""])
             used.add(id(r))
         else:
@@ -396,7 +413,7 @@ def parse_question_page(ocr_lines, frame_w, frame_h, slot_hint=None):
         if id(r) in used:
             continue
         nearest = min(letter_rows, key=lambda lr: abs(lr[1] - r["y"]))
-        if abs(nearest[1] - r["y"]) <= row_gap * 0.6:
+        if abs(nearest[1] - r["y"]) <= row_gap * layout.row_gap_match_ratio:
             info = options[nearest[0]]
             info["text"] = (info["text"] + " " + r["text"]).strip()
 

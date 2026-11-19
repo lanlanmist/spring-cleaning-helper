@@ -24,7 +24,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- 全局常量 ---
-APP_VERSION = "大扫除小助手 V3.3"
+APP_VERSION = "大扫除小助手 V3.4"
 PARAMS_FILE = os.path.join(BASE_DIR, "params.json")
 ADB_DIR = os.path.join(BASE_DIR, "adb")
 SHOT_DIR = os.path.join(BASE_DIR, "screenshots")
@@ -40,8 +40,8 @@ WORD_SUBMIT = "确定"          # 已选择选项后的提交按钮
 WORD_CORRECT_ANSWER = "正确答案"  # 判分页答案解析中的正确答案
 WORD_LOADING = "加载中"        # 判分页刚出现时残留的加载提示（截图需等它消失）
 # 提交/判分页的按钮（确定 / 下一题 / 完成）固定在页面顶部四分之一内；
-# 用位置约束避免题干或答案解析里出现同样的词时误判状态
-BUTTON_TOP_RATIO = 0.25
+# 这个比例与其余布局参数一起归到 layout_profile.DEFAULT_LAYOUT
+# （button_top_ratio），避免两处各写一份。
 
 # 默认参数（毫秒）
 DEFAULT_PROMPT = "请给出这道题的答案。只给出选项，不用给出解析。不需要给出任何分析过程，只给出答案选项。如果单选，给出一个大写字母选项；如果多选，选项间用逗号隔开：\n"
@@ -68,6 +68,57 @@ DEFAULT_SCROLL_SETTLE_MS = 1000  # 全部滚动结束后、OCR 识别前的等�
 # AI 答案轮询重试（固定等待期满后答案可能尚未生成，如深度检索类 AI）
 AI_ANSWER_RETRY_S = 15         # 固定等待期满后，最多再轮询等待的秒数
 AI_ANSWER_POLL_S = 1.5         # 两次轮询识别的间隔秒数
+
+# --- 连接设备时可选的附加设置 ---
+# 每项包含两类动作：scrcpy 命令行参数（画质/帧率/镜像行为）与 adb shell
+# 设置（锁屏、亮度这类系统项，scrcpy 无法直接控制）。界面勾选后，点
+# 「连接」时按顺序拼出去，不勾选就一项也不做。
+SCRCPY_OPTIONS = (
+    {
+        "key": "stay_awake",
+        "label": "禁用锁屏",
+        "scrcpy": ("--stay-awake",),
+        "shell": (("保持屏幕常亮(USB 连接期间不自动锁屏)",
+                   ("shell", "svc", "power", "stayon", "usb")),),
+    },
+    {
+        "key": "screen_off",
+        "label": "关闭手机屏幕",
+        "scrcpy": ("--turn-screen-off",),
+        "shell": (),
+    },
+    {
+        "key": "low_brightness",
+        "label": "最低亮度",
+        "scrcpy": (),
+        "shell": (("亮度改为手动模式",
+                   ("shell", "settings", "put", "system",
+                    "screen_brightness_mode", "0")),
+                  ("亮度调至最低",
+                   ("shell", "settings", "put", "system",
+                    "screen_brightness", "0"))),
+    },
+    {
+        "key": "high_fps",
+        "label": "高帧率 60fps",
+        "scrcpy": ("--max-fps", "60"),
+        "shell": (),
+    },
+    {
+        "key": "high_bitrate",
+        "label": "高码率 16M",
+        "scrcpy": ("--video-bit-rate", "16M"),
+        "shell": (),
+    },
+    {
+        "key": "low_res",
+        "label": "720p 分辨率",
+        "scrcpy": ("--max-size", "720"),
+        "shell": (),
+    },
+)
+# 首次运行（参数文件里没有 scrcpy_options）时的默认勾选
+DEFAULT_SCRCPY_OPTIONS = ("stay_awake", "screen_off")
 
 # OCR 引擎：见 ocr_engine.py（懒加载单例 + 后台预热）。
 # 这里只保留模型目录路径，import 本模块不再触发 20~30 秒的模型加载。
