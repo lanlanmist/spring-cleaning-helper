@@ -137,26 +137,17 @@ class AdbService:
                    str(int(x2)), str(int(y2)), str(int(duration_ms))])
 
     # ------------------------------------------------------------------
-    # 连接后设备准备（防锁屏 / 调低亮度）
+    # 连接后设备设置（具体做什么由界面勾选项决定）
     # ------------------------------------------------------------------
-    def prepare_device(self, brightness=30):
-        """连接后一次性设置，返回 [(描述, 错误信息或 None), ...]。
+    def apply_shell_steps(self, steps):
+        """逐项执行 (描述, 参数列表) 形式的 adb shell 设置。
 
-        单项失败不阻断，由调用方记录日志。
+        单项失败不阻断，返回 [(描述, 错误信息或 None), ...] 由调用方记日志。
         """
-        steps = [
-            ("保持屏幕常亮(USB 连接期间不自动锁屏)",
-             ["shell", "svc", "power", "stayon", "usb"]),
-            ("亮度改为手动模式",
-             ["shell", "settings", "put", "system", "screen_brightness_mode", "0"]),
-            (f"亮度调低至 {brightness}",
-             ["shell", "settings", "put", "system", "screen_brightness",
-              str(int(brightness))]),
-        ]
         results = []
         for desc, args in steps:
             try:
-                self._run(self._device_args() + args)
+                self._run(self._device_args() + list(args))
                 results.append((desc, None))
             except AdbError as e:
                 results.append((desc, str(e)))
@@ -165,10 +156,8 @@ class AdbService:
     # ------------------------------------------------------------------
     # scrcpy 镜像（连接后自动启动）
     # ------------------------------------------------------------------
-    def launch_scrcpy(self, extra_args=("--turn-screen-off", "--stay-awake",
-                                        "--video-bit-rate", "10M",
-                                        "--max-fps", "60")):
-        """后台启动 scrcpy 镜像，设备屏幕关闭但保持唤醒。
+    def launch_scrcpy(self, extra_args=()):
+        """后台启动 scrcpy 镜像；参数由调用方按界面勾选项拼好传进来。
 
         已在运行则不重复启动；找不到 scrcpy 抛 AdbError。
         """
@@ -187,4 +176,4 @@ class AdbService:
             )
         except OSError as e:
             raise AdbError(f"scrcpy 启动失败：{e}")
-        return " ".join(extra_args)
+        return " ".join(extra_args) if extra_args else "scrcpy 默认参数"

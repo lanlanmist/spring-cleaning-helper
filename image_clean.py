@@ -8,15 +8,13 @@ R 通道比 G/B 通道高约 10~16，整体亮度 > 100，占比约 0.4%。
 
 import numpy as np
 
-# 水印判定阈值：R 相对 G/B 的偏红量、最低亮度。
-# 水印主体偏红约 10~16，抗锯齿边缘可低至 3~6，故阈值取 4。
-WM_RED_EXCESS = 4
-WM_MIN_R = 100
-# 强偏红（水印笔画主体）：直接拉到近白，彻底消除笔画
-WM_STRONG_EXCESS = 8
+from layout_profile import DEFAULT_LAYOUT
+
+# 水印判定阈值见 layout_profile（wm_red_excess / wm_min_r / wm_strong_excess）：
+# 水印主体偏红约 10~16，抗锯齿边缘可低至 3~6，故偏红阈值取 4。
 
 
-def remove_watermark(img):
+def remove_watermark(img, layout=DEFAULT_LAYOUT):
     """抹除浅粉色水印，返回同尺寸 RGB numpy 数组。
 
     - 强偏红像素（水印主体）：置为近白 (250,250,250)；
@@ -27,9 +25,9 @@ def remove_watermark(img):
     r, g, b = out[:, :, 0], out[:, :, 1], out[:, :, 2]
     excess_g = r - g
     excess_b = r - b
-    base = (excess_g > WM_RED_EXCESS) & (excess_b > WM_RED_EXCESS) \
-        & (r > WM_MIN_R)
-    strong = base & (excess_g > WM_STRONG_EXCESS)
+    base = (excess_g > layout.wm_red_excess) \
+        & (excess_b > layout.wm_red_excess) & (r > layout.wm_min_r)
+    strong = base & (excess_g > layout.wm_strong_excess)
     weak = base & ~strong
     out[strong] = 250
     out[weak, 0] = out[weak, 1]

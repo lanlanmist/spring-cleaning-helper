@@ -6,6 +6,8 @@ Esc 取消选择。标定结果仅存运行期内存，由主程序管理。
 
 import tkinter as tk
 
+from ui_widgets import ui_font
+
 
 class BaseSelector:
     def __init__(self, parent, title):
@@ -19,7 +21,7 @@ class BaseSelector:
 
         self.label = tk.Label(self.win, text=title + "\n(按 Esc 取消本次标定)",
                               fg="#00FF00", bg="black",
-                              font=("微软雅黑", 28, "bold"),
+                              font=ui_font(29, "bold"),
                               relief="raised", borderwidth=5)
         self.label.place(relx=0.5, rely=0.15, anchor="center")
 
